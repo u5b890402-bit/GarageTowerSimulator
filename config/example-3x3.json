@@ -1,0 +1,63 @@
+{
+  "simulation": {
+    "sessionName": "example-3x3-baseline",
+    "startTime": "2026-06-01T00:00:00-07:00",
+    "durationSeconds": 3600,
+    "tickSeconds": 1,
+    "timezone": "America/Los_Angeles",
+    "seed": 12345,
+    "outputDir": "output",
+    "rawOutputFile": "example-3x3-baseline.jsonl",
+    "revenuePolicy": {
+      "chargePerBillingBlock": 30,
+      "billingBlockMinutes": 30
+    },
+    "balkingPolicy": {
+      "startsAtQueueLength": 13,
+      "initialProbability": 0.5,
+      "probabilityStep": 0.1,
+      "certainAtQueueLength": 18
+    }
+  },
+  "demand": {
+    "averageInboundPerDay": 1200,
+    "weekendMultiplier": 0.5,
+    "peakHour": 9,
+    "peakWindowHours": 2,
+    "peakShare": 0.5,
+    "parkingDuration": {
+      "minHours": 0.05,
+      "maxHours": 0.4,
+      "modeHours": 0.15
+    }
+  },
+  "garage": {
+    "layout": {
+      "rows": 3,
+      "columns": 3,
+      "floors": 10,
+      "elevatorCell": 5,
+      "unavailableCells": [],
+      "streetFacing": "longSide"
+    },
+    "elevator": {
+      "deckCount": 2,
+      "verticalSpeedMetersPerSecond": 0.9,
+      "floorHeightMeters": 2.7,
+      "deckRotationSeconds": 6
+    },
+    "vmr": {
+      "speedMetersPerSecond": 1.5,
+      "gripReleaseSeconds": 10
+    },
+    "preparationPositions": {
+      "inboundCount": 2,
+      "outboundCount": 2,
+      "kind": "parallel",
+      "mode": "designated",
+      "parallelClearSeconds": 60,
+      "sequentialClearSeconds": 80,
+      "doorSeconds": 5
+    }
+  }
+}
