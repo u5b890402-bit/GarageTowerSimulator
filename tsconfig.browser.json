@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "amd",
+    "moduleResolution": "node",
+    "target": "es2020",
+    "outFile": "./public/simulator.bundle.js",
+    "rootDir": "./src",
+    "sourceMap": false,
+    "declaration": false,
+    "declarationMap": false,
+    "isolatedModules": false,
+    "verbatimModuleSyntax": false,
+    "noUncheckedSideEffectImports": false,
+    "ignoreDeprecations": "6.0"
+  },
+  "files": ["src/browser/app.ts"]
+}

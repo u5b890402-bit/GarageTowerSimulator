@@ -19,6 +19,7 @@ config/
   example-3x3.json          Example simulation configuration
 
 src/
+  browser/                  Browser UI entrypoint
   config/                   Config loading and validation
   domain/                   Core interfaces and shared types
   garage/                   Baseline garage implementation and strategies
@@ -28,6 +29,7 @@ src/
   run-report.ts             Report CLI entrypoint
 
 output/                     Generated raw outputs and reports
+public/                     Static browser UI
 dist/                       Compiled JavaScript output
 ```
 
@@ -44,6 +46,14 @@ Build:
 ```bash
 npm run build
 ```
+
+Build the static browser app:
+
+```bash
+npm run build:browser
+```
+
+Then open [public/index.html](public/index.html) in a browser.
 
 Run the example simulation:
 
@@ -90,6 +100,45 @@ npm run test:integration
 ```
 
 That command builds the project, runs the example simulation, and generates a report.
+
+Check the browser bundle build:
+
+```bash
+npm run test:browser-build
+```
+
+## Browser App
+
+The browser app is intended for non-developer use. It runs the TypeScript simulation engine in the browser and does not require the user to run CLI commands after the static files have been prepared.
+
+Build it:
+
+```bash
+npm run build:browser
+```
+
+Open:
+
+```text
+public/index.html
+```
+
+The browser app lets the user:
+
+- Load the example configuration.
+- Edit configuration JSON directly.
+- Run a simulation.
+- See a summary of key report metrics.
+- Download the compact raw JSONL output.
+- Download the generated JSON report.
+
+The browser build emits:
+
+```text
+public/simulator.bundle.js
+```
+
+That bundle is compiled from the same TypeScript core used by the Node CLI. The browser path uses an in-memory recorder instead of filesystem writes, then downloads raw output and report files through the browser.
 
 ## Configuration
 

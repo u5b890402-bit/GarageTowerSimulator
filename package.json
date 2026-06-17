@@ -2,9 +2,11 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
+    "build:browser": "tsc -p tsconfig.browser.json",
     "simulate": "npm run build && node dist/run-simulation.js",
     "report": "npm run build && node dist/run-report.js",
-    "test:integration": "npm run build && node dist/run-simulation.js config/example-3x3.json && node dist/run-report.js output/example-3x3-baseline.jsonl output/example-3x3-report.json"
+    "test:integration": "npm run build && node dist/run-simulation.js config/example-3x3.json && node dist/run-report.js output/example-3x3-baseline.jsonl output/example-3x3-report.json",
+    "test:browser-build": "npm run build:browser"
   },
   "devDependencies": {
     "typescript": "^6.0.3"

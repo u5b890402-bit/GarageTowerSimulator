@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Parking Tower Simulator</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <h1>Parking Tower Simulator</h1>
+            <p id="status" data-state="normal">Ready.</p>
+          </div>
+          <div class="actions">
+            <button id="load-example-button" type="button">Load Example</button>
+            <button id="run-button" type="button">Run Simulation</button>
+          </div>
+        </header>
+
+        <section class="config-panel" aria-label="Simulation configuration">
+          <label for="config-input">Configuration JSON</label>
+          <textarea id="config-input" spellcheck="false"></textarea>
+        </section>
+
+        <section class="progress-panel" aria-label="Simulation progress">
+          <div class="progress-row">
+            <progress id="progress" max="100" value="0"></progress>
+            <span id="progress-label">0%</span>
+          </div>
+        </section>
+      </section>
+
+      <aside class="results-panel" aria-label="Simulation report summary">
+        <h2>Report Summary</h2>
+        <dl class="metric-grid">
+          <div>
+            <dt>Activities</dt>
+            <dd id="metric-activities">-</dd>
+          </div>
+          <div>
+            <dt>Final Occupancy</dt>
+            <dd id="metric-occupancy">-</dd>
+          </div>
+          <div>
+            <dt>Avg Inbound Wait</dt>
+            <dd id="metric-inbound-wait">-</dd>
+          </div>
+          <div>
+            <dt>Avg Outbound Wait</dt>
+            <dd id="metric-outbound-wait">-</dd>
+          </div>
+          <div>
+            <dt>Revenue</dt>
+            <dd id="metric-revenue">-</dd>
+          </div>
+          <div>
+            <dt>Raw Size</dt>
+            <dd id="metric-raw-size">-</dd>
+          </div>
+        </dl>
+        <div class="download-actions">
+          <button id="download-report-button" type="button" disabled>Download Report</button>
+          <button id="download-raw-button" type="button" disabled>Download Raw Output</button>
+        </div>
+      </aside>
+    </main>
+
+    <script>
+      (function () {
+        const modules = {};
+        const cache = {};
+
+        window.define = function (name, deps, factory) {
+          modules[name] = { deps, factory };
+        };
+
+        window.require = function (deps, callback) {
+          const resolved = deps.map(load);
+          callback && callback.apply(null, resolved);
+        };
+
+        function load(name) {
+          if (cache[name]) return cache[name];
+          if (!modules[name]) throw new Error("Module not found: " + name);
+          const exports = {};
+          const module = { exports };
+          const resolved = modules[name].deps.map(function (dep) {
+            if (dep === "require") return window.require;
+            if (dep === "exports") return exports;
+            if (dep === "module") return module;
+            return load(resolveName(name, dep));
+          });
+          modules[name].factory.apply(null, resolved);
+          cache[name] = module.exports !== exports ? module.exports : exports;
+          return cache[name];
+        }
+
+        function resolveName(from, dep) {
+          if (!dep.startsWith(".")) return dep;
+          const parts = from.split("/");
+          parts.pop();
+          for (const part of dep.split("/")) {
+            if (part === "." || part === "") continue;
+            if (part === "..") parts.pop();
+            else parts.push(part);
+          }
+          return parts.join("/");
+        }
+      })();
+    </script>
+    <script src="./simulator.bundle.js"></script>
+    <script>
+      require(["browser/app"], function (app) {
+        app.startApp();
+      });
+    </script>
+  </body>
+</html>

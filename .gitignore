@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 *.tsbuildinfo
+public.zip
 
 # Generated simulation artifacts
 output/
