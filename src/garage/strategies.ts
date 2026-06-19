@@ -38,6 +38,24 @@ export class LowestCostPlacementStrategy implements PlacementStrategy {
   }
 }
 
+export class FirstAvailablePlacementStrategy implements PlacementStrategy {
+  rankCandidateCells(context: PlacementContext): RankedCell[] {
+    const occupied = new Set(context.occupancy.occupied.map((cell) => cell.cellId));
+    return context.layout
+      .getParkingCells()
+      .filter((cellId) => !occupied.has(cellId))
+      .map((cellId, index) => ({
+        cellId,
+        score: index,
+        reason: "First available cell in layout order.",
+      }));
+  }
+
+  chooseCell(_vehicleId: VehicleId, context: PlacementContext, _rng: RandomSource): CellId | null {
+    return this.rankCandidateCells(context)[0]?.cellId ?? null;
+  }
+}
+
 export class SimpleRetrievalStrategy implements RetrievalStrategy {
   classifyRequest(vehicleId: VehicleId, context: RetrievalContext): RetrievalClass {
     const location = context.occupancy.occupied.find((cell) => cell.vehicleId === vehicleId);
@@ -87,14 +105,4 @@ export class NoopUnblockingStrategy implements UnblockingStrategy {
   planUnblocking(_context: UnblockingContext): UnblockingPlan | null {
     return null;
   }
-}
-
-export function createBaselineStrategies() {
-  return {
-    placementStrategy: new LowestCostPlacementStrategy(),
-    retrievalStrategy: new SimpleRetrievalStrategy(),
-    tripPlanner: new NoopElevatorTripPlanner(),
-    ppAssignmentPolicy: new FixedPreparationPositionPolicy(),
-    unblockingStrategy: new NoopUnblockingStrategy(),
-  };
 }

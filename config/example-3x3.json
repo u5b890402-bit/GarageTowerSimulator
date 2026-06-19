@@ -58,6 +58,23 @@
       "parallelClearSeconds": 60,
       "sequentialClearSeconds": 80,
       "doorSeconds": 5
+    },
+    "strategies": {
+      "placement": {
+        "type": "lowest-access-cost"
+      },
+      "retrieval": {
+        "type": "simple-retrieval"
+      },
+      "tripPlanner": {
+        "type": "single-operation"
+      },
+      "preparationPositions": {
+        "type": "fixed-assignment"
+      },
+      "unblocking": {
+        "type": "disabled"
+      }
     }
   }
 }

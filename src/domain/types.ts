@@ -66,6 +66,34 @@ export interface GarageConfig {
   elevator: ElevatorConfig;
   vmr: VmrConfig;
   preparationPositions: PreparationPositionConfig;
+  strategies?: GarageStrategyConfig;
+}
+
+export interface StrategySelection {
+  type: string;
+  options?: Record<string, unknown>;
+}
+
+export interface GarageStrategyConfig {
+  placement: StrategySelection;
+  retrieval: StrategySelection;
+  tripPlanner: StrategySelection;
+  preparationPositions: StrategySelection;
+  unblocking: StrategySelection;
+}
+
+export type StrategyCategory =
+  | "placement"
+  | "retrieval"
+  | "tripPlanner"
+  | "preparationPositions"
+  | "unblocking";
+
+export interface StrategyDescriptor {
+  category: StrategyCategory;
+  type: string;
+  label: string;
+  description: string;
 }
 
 export interface LayoutConfig {

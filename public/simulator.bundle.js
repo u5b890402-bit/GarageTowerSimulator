@@ -2,7 +2,288 @@ define("domain/types", ["require", "exports"], function (require, exports) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
 });
-define("config/validate-config", ["require", "exports"], function (require, exports) {
+define("garage/strategies", ["require", "exports"], function (require, exports) {
+    "use strict";
+    Object.defineProperty(exports, "__esModule", { value: true });
+    exports.NoopUnblockingStrategy = exports.FixedPreparationPositionPolicy = exports.NoopElevatorTripPlanner = exports.SimpleRetrievalStrategy = exports.FirstAvailablePlacementStrategy = exports.LowestCostPlacementStrategy = void 0;
+    class LowestCostPlacementStrategy {
+        rankCandidateCells(context) {
+            const occupied = new Set(context.occupancy.occupied.map((cell) => cell.cellId));
+            return context.layout
+                .getParkingCells()
+                .filter((cellId) => !occupied.has(cellId))
+                .map((cellId) => ({
+                cellId,
+                score: context.layout.estimateAccessCost(cellId, context.occupancy),
+                reason: "Lowest estimated access cost in simple baseline strategy.",
+            }))
+                .sort((a, b) => a.score - b.score || a.cellId.localeCompare(b.cellId));
+        }
+        chooseCell(_vehicleId, context, _rng) {
+            return this.rankCandidateCells(context)[0]?.cellId ?? null;
+        }
+    }
+    exports.LowestCostPlacementStrategy = LowestCostPlacementStrategy;
+    class FirstAvailablePlacementStrategy {
+        rankCandidateCells(context) {
+            const occupied = new Set(context.occupancy.occupied.map((cell) => cell.cellId));
+            return context.layout
+                .getParkingCells()
+                .filter((cellId) => !occupied.has(cellId))
+                .map((cellId, index) => ({
+                cellId,
+                score: index,
+                reason: "First available cell in layout order.",
+            }));
+        }
+        chooseCell(_vehicleId, context, _rng) {
+            return this.rankCandidateCells(context)[0]?.cellId ?? null;
+        }
+    }
+    exports.FirstAvailablePlacementStrategy = FirstAvailablePlacementStrategy;
+    class SimpleRetrievalStrategy {
+        classifyRequest(vehicleId, context) {
+            const location = context.occupancy.occupied.find((cell) => cell.vehicleId === vehicleId);
+            if (!location) {
+                return { blockage: "none", estimatedSeconds: 0 };
+            }
+            const blockage = context.layout.classifyBlockage(location.cellId, context.occupancy);
+            return {
+                blockage,
+                estimatedSeconds: context.layout.estimateAccessCost(location.cellId, context.occupancy),
+            };
+        }
+        buildRetrievalPlan(vehicleId, context) {
+            const classification = this.classifyRequest(vehicleId, context);
+            return {
+                vehicleId,
+                blockers: [],
+                estimatedSeconds: classification.estimatedSeconds,
+            };
+        }
+    }
+    exports.SimpleRetrievalStrategy = SimpleRetrievalStrategy;
+    class NoopElevatorTripPlanner {
+        planNextTrip() {
+            return null;
+        }
+    }
+    exports.NoopElevatorTripPlanner = NoopElevatorTripPlanner;
+    class FixedPreparationPositionPolicy {
+        chooseAssignments(context) {
+            const inboundPositionIds = context.snapshot.preparationPositions
+                .filter((position) => position.direction === "inbound")
+                .map((position) => position.id);
+            const outboundPositionIds = context.snapshot.preparationPositions
+                .filter((position) => position.direction === "outbound")
+                .map((position) => position.id);
+            return { inboundPositionIds, outboundPositionIds };
+        }
+    }
+    exports.FixedPreparationPositionPolicy = FixedPreparationPositionPolicy;
+    class NoopUnblockingStrategy {
+        shouldStartIdleUnblocking(_context) {
+            return false;
+        }
+        planUnblocking(_context) {
+            return null;
+        }
+    }
+    exports.NoopUnblockingStrategy = NoopUnblockingStrategy;
+});
+define("garage/strategy-registry", ["require", "exports", "garage/strategies"], function (require, exports, strategies_js_1) {
+    "use strict";
+    Object.defineProperty(exports, "__esModule", { value: true });
+    exports.defaultGarageStrategyConfig = void 0;
+    exports.createGarageStrategies = createGarageStrategies;
+    exports.normalizeGarageStrategyConfig = normalizeGarageStrategyConfig;
+    exports.validateGarageStrategyConfig = validateGarageStrategyConfig;
+    exports.getStrategyDescriptors = getStrategyDescriptors;
+    exports.defaultGarageStrategyConfig = {
+        placement: { type: "lowest-access-cost" },
+        retrieval: { type: "simple-retrieval" },
+        tripPlanner: { type: "single-operation" },
+        preparationPositions: { type: "fixed-assignment" },
+        unblocking: { type: "disabled" },
+    };
+    const placementRegistry = {
+        factories: {
+            "lowest-access-cost": (options) => {
+                requireNoOptions("lowest-access-cost", options);
+                return new strategies_js_1.LowestCostPlacementStrategy();
+            },
+            "first-available": (options) => {
+                requireNoOptions("first-available", options);
+                return new strategies_js_1.FirstAvailablePlacementStrategy();
+            },
+        },
+        descriptors: [
+            {
+                category: "placement",
+                type: "lowest-access-cost",
+                label: "Lowest Access Cost",
+                description: "Chooses the empty cell with the lowest estimated elevator, movement, and blockage cost.",
+            },
+            {
+                category: "placement",
+                type: "first-available",
+                label: "First Available",
+                description: "Chooses the first empty parking cell in layout order.",
+            },
+        ],
+    };
+    const retrievalRegistry = {
+        factories: {
+            "simple-retrieval": (options) => {
+                requireNoOptions("simple-retrieval", options);
+                return new strategies_js_1.SimpleRetrievalStrategy();
+            },
+        },
+        descriptors: [
+            {
+                category: "retrieval",
+                type: "simple-retrieval",
+                label: "Simple Retrieval",
+                description: "Classifies blockage and estimates retrieval cost without moving blockers.",
+            },
+        ],
+    };
+    const tripPlannerRegistry = {
+        factories: {
+            "single-operation": (options) => {
+                requireNoOptions("single-operation", options);
+                return new strategies_js_1.NoopElevatorTripPlanner();
+            },
+        },
+        descriptors: [
+            {
+                category: "tripPlanner",
+                type: "single-operation",
+                label: "Single Operation",
+                description: "Uses the baseline garage's one-operation-at-a-time scheduling behavior.",
+            },
+        ],
+    };
+    const preparationPositionRegistry = {
+        factories: {
+            "fixed-assignment": (options) => {
+                requireNoOptions("fixed-assignment", options);
+                return new strategies_js_1.FixedPreparationPositionPolicy();
+            },
+        },
+        descriptors: [
+            {
+                category: "preparationPositions",
+                type: "fixed-assignment",
+                label: "Fixed Assignment",
+                description: "Keeps preparation positions assigned to their configured inbound or outbound direction.",
+            },
+        ],
+    };
+    const unblockingRegistry = {
+        factories: {
+            disabled: (options) => {
+                requireNoOptions("disabled", options);
+                return new strategies_js_1.NoopUnblockingStrategy();
+            },
+        },
+        descriptors: [
+            {
+                category: "unblocking",
+                type: "disabled",
+                label: "Disabled",
+                description: "Does not initiate idle unblocking operations.",
+            },
+        ],
+    };
+    function createGarageStrategies(config) {
+        const normalized = normalizeGarageStrategyConfig(config);
+        return {
+            placementStrategy: createFromRegistry(placementRegistry, normalized.placement),
+            retrievalStrategy: createFromRegistry(retrievalRegistry, normalized.retrieval),
+            tripPlanner: createFromRegistry(tripPlannerRegistry, normalized.tripPlanner),
+            ppAssignmentPolicy: createFromRegistry(preparationPositionRegistry, normalized.preparationPositions),
+            unblockingStrategy: createFromRegistry(unblockingRegistry, normalized.unblocking),
+        };
+    }
+    function normalizeGarageStrategyConfig(config) {
+        if (!config) {
+            return cloneDefaultConfig();
+        }
+        return {
+            placement: config.placement ?? { ...exports.defaultGarageStrategyConfig.placement },
+            retrieval: config.retrieval ?? { ...exports.defaultGarageStrategyConfig.retrieval },
+            tripPlanner: config.tripPlanner ?? { ...exports.defaultGarageStrategyConfig.tripPlanner },
+            preparationPositions: config.preparationPositions ?? { ...exports.defaultGarageStrategyConfig.preparationPositions },
+            unblocking: config.unblocking ?? { ...exports.defaultGarageStrategyConfig.unblocking },
+        };
+    }
+    function validateGarageStrategyConfig(config) {
+        if (!config)
+            return [];
+        const normalized = normalizeGarageStrategyConfig(config);
+        return [
+            ...validateSelection("placement", placementRegistry, normalized.placement),
+            ...validateSelection("retrieval", retrievalRegistry, normalized.retrieval),
+            ...validateSelection("tripPlanner", tripPlannerRegistry, normalized.tripPlanner),
+            ...validateSelection("preparationPositions", preparationPositionRegistry, normalized.preparationPositions),
+            ...validateSelection("unblocking", unblockingRegistry, normalized.unblocking),
+        ];
+    }
+    function getStrategyDescriptors() {
+        return [
+            ...placementRegistry.descriptors,
+            ...retrievalRegistry.descriptors,
+            ...tripPlannerRegistry.descriptors,
+            ...preparationPositionRegistry.descriptors,
+            ...unblockingRegistry.descriptors,
+        ];
+    }
+    function createFromRegistry(registry, selection) {
+        const factory = registry.factories[selection.type];
+        if (!factory) {
+            throw new Error(unknownStrategyMessage(selection.type, registry));
+        }
+        return factory(selection.options ?? {});
+    }
+    function validateSelection(category, registry, selection) {
+        if (!selection || typeof selection.type !== "string" || selection.type.length === 0) {
+            return [`garage.strategies.${category}.type is required.`];
+        }
+        const factory = registry.factories[selection.type];
+        if (!factory) {
+            return [`garage.strategies.${category}: ${unknownStrategyMessage(selection.type, registry)}`];
+        }
+        try {
+            factory(selection.options ?? {});
+            return [];
+        }
+        catch (error) {
+            return [
+                `garage.strategies.${category}.${selection.type}: ${error instanceof Error ? error.message : String(error)}`,
+            ];
+        }
+    }
+    function unknownStrategyMessage(type, registry) {
+        return `Unknown strategy '${type}'. Available strategies: ${Object.keys(registry.factories).join(", ")}.`;
+    }
+    function requireNoOptions(type, options) {
+        const keys = Object.keys(options);
+        if (keys.length > 0) {
+            throw new Error(`Strategy '${type}' does not accept options. Unexpected: ${keys.join(", ")}.`);
+        }
+    }
+    function cloneDefaultConfig() {
+        return {
+            placement: { ...exports.defaultGarageStrategyConfig.placement },
+            retrieval: { ...exports.defaultGarageStrategyConfig.retrieval },
+            tripPlanner: { ...exports.defaultGarageStrategyConfig.tripPlanner },
+            preparationPositions: { ...exports.defaultGarageStrategyConfig.preparationPositions },
+            unblocking: { ...exports.defaultGarageStrategyConfig.unblocking },
+        };
+    }
+});
+define("config/validate-config", ["require", "exports", "garage/strategy-registry"], function (require, exports, strategy_registry_js_1) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
     exports.validateSimulationConfig = validateSimulationConfig;
@@ -34,6 +315,7 @@ define("config/validate-config", ["require", "exports"], function (require, expo
             if (preparationPositions.inboundCount < 0 || preparationPositions.outboundCount < 0) {
                 errors.push("preparation position counts cannot be negative.");
             }
+            errors.push(...(0, strategy_registry_js_1.validateGarageStrategyConfig)(config.garage.strategies));
         }
         return { valid: errors.length === 0, errors };
     }
@@ -951,88 +1233,6 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout"], fun
     }
     exports.SimpleGarageTowerSystem = SimpleGarageTowerSystem;
 });
-define("garage/strategies", ["require", "exports"], function (require, exports) {
-    "use strict";
-    Object.defineProperty(exports, "__esModule", { value: true });
-    exports.NoopUnblockingStrategy = exports.FixedPreparationPositionPolicy = exports.NoopElevatorTripPlanner = exports.SimpleRetrievalStrategy = exports.LowestCostPlacementStrategy = void 0;
-    exports.createBaselineStrategies = createBaselineStrategies;
-    class LowestCostPlacementStrategy {
-        rankCandidateCells(context) {
-            const occupied = new Set(context.occupancy.occupied.map((cell) => cell.cellId));
-            return context.layout
-                .getParkingCells()
-                .filter((cellId) => !occupied.has(cellId))
-                .map((cellId) => ({
-                cellId,
-                score: context.layout.estimateAccessCost(cellId, context.occupancy),
-                reason: "Lowest estimated access cost in simple baseline strategy.",
-            }))
-                .sort((a, b) => a.score - b.score || a.cellId.localeCompare(b.cellId));
-        }
-        chooseCell(_vehicleId, context, _rng) {
-            return this.rankCandidateCells(context)[0]?.cellId ?? null;
-        }
-    }
-    exports.LowestCostPlacementStrategy = LowestCostPlacementStrategy;
-    class SimpleRetrievalStrategy {
-        classifyRequest(vehicleId, context) {
-            const location = context.occupancy.occupied.find((cell) => cell.vehicleId === vehicleId);
-            if (!location) {
-                return { blockage: "none", estimatedSeconds: 0 };
-            }
-            const blockage = context.layout.classifyBlockage(location.cellId, context.occupancy);
-            return {
-                blockage,
-                estimatedSeconds: context.layout.estimateAccessCost(location.cellId, context.occupancy),
-            };
-        }
-        buildRetrievalPlan(vehicleId, context) {
-            const classification = this.classifyRequest(vehicleId, context);
-            return {
-                vehicleId,
-                blockers: [],
-                estimatedSeconds: classification.estimatedSeconds,
-            };
-        }
-    }
-    exports.SimpleRetrievalStrategy = SimpleRetrievalStrategy;
-    class NoopElevatorTripPlanner {
-        planNextTrip() {
-            return null;
-        }
-    }
-    exports.NoopElevatorTripPlanner = NoopElevatorTripPlanner;
-    class FixedPreparationPositionPolicy {
-        chooseAssignments(context) {
-            const inboundPositionIds = context.snapshot.preparationPositions
-                .filter((position) => position.direction === "inbound")
-                .map((position) => position.id);
-            const outboundPositionIds = context.snapshot.preparationPositions
-                .filter((position) => position.direction === "outbound")
-                .map((position) => position.id);
-            return { inboundPositionIds, outboundPositionIds };
-        }
-    }
-    exports.FixedPreparationPositionPolicy = FixedPreparationPositionPolicy;
-    class NoopUnblockingStrategy {
-        shouldStartIdleUnblocking(_context) {
-            return false;
-        }
-        planUnblocking(_context) {
-            return null;
-        }
-    }
-    exports.NoopUnblockingStrategy = NoopUnblockingStrategy;
-    function createBaselineStrategies() {
-        return {
-            placementStrategy: new LowestCostPlacementStrategy(),
-            retrievalStrategy: new SimpleRetrievalStrategy(),
-            tripPlanner: new NoopElevatorTripPlanner(),
-            ppAssignmentPolicy: new FixedPreparationPositionPolicy(),
-            unblockingStrategy: new NoopUnblockingStrategy(),
-        };
-    }
-});
 define("simulation/random", ["require", "exports"], function (require, exports) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
@@ -1137,7 +1337,7 @@ define("simulation/demand-generator", ["require", "exports", "simulation/random"
     }
     exports.SeededDemandGenerator = SeededDemandGenerator;
 });
-define("simulation/session-factory", ["require", "exports", "garage/simple-garage", "garage/strategies", "simulation/demand-generator", "simulation/random"], function (require, exports, simple_garage_js_1, strategies_js_1, demand_generator_js_1, random_js_2) {
+define("simulation/session-factory", ["require", "exports", "garage/simple-garage", "garage/strategy-registry", "simulation/demand-generator", "simulation/random"], function (require, exports, simple_garage_js_1, strategy_registry_js_2, demand_generator_js_1, random_js_2) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
     exports.createSimulationSession = createSimulationSession;
@@ -1149,7 +1349,7 @@ define("simulation/session-factory", ["require", "exports", "garage/simple-garag
         }
     }
     function createSimulationSession(config, recorder) {
-        const strategies = (0, strategies_js_1.createBaselineStrategies)();
+        const strategies = (0, strategy_registry_js_2.createGarageStrategies)(config.garage.strategies);
         const garage = new SimpleGarageFactory().createGarage(config.garage, strategies);
         const demandGenerator = new demand_generator_js_1.SeededDemandGenerator();
         demandGenerator.initialize(config.demand, config.simulation.seed);
@@ -1247,7 +1447,7 @@ define("simulation/simulation-engine", ["require", "exports", "simulation/teleme
     }
     exports.SimulationEngine = SimulationEngine;
 });
-define("browser/app", ["require", "exports", "config/validate-config", "report/report-builder", "simulation/in-memory-recorder", "simulation/session-factory", "simulation/simulation-engine"], function (require, exports, validate_config_js_1, report_builder_js_1, in_memory_recorder_js_1, session_factory_js_1, simulation_engine_js_1) {
+define("browser/app", ["require", "exports", "config/validate-config", "garage/strategy-registry", "report/report-builder", "simulation/in-memory-recorder", "simulation/session-factory", "simulation/simulation-engine"], function (require, exports, validate_config_js_1, strategy_registry_js_3, report_builder_js_1, in_memory_recorder_js_1, session_factory_js_1, simulation_engine_js_1) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
     exports.startApp = startApp;
@@ -1312,9 +1512,23 @@ define("browser/app", ["require", "exports", "config/validate-config", "report/r
                 sequentialClearSeconds: 80,
                 doorSeconds: 5,
             },
+            strategies: {
+                placement: { type: "lowest-access-cost" },
+                retrieval: { type: "simple-retrieval" },
+                tripPlanner: { type: "single-operation" },
+                preparationPositions: { type: "fixed-assignment" },
+                unblocking: { type: "disabled" },
+            },
         },
     };
     let latestRun = null;
+    const strategyControlIds = {
+        placement: "placement-strategy",
+        retrieval: "retrieval-strategy",
+        tripPlanner: "trip-planner-strategy",
+        preparationPositions: "pp-strategy",
+        unblocking: "unblocking-strategy",
+    };
     function startApp() {
         const configInput = getElement("config-input");
         const runButton = getElement("run-button");
@@ -1322,10 +1536,13 @@ define("browser/app", ["require", "exports", "config/validate-config", "report/r
         const rawDownloadButton = getElement("download-raw-button");
         const reportDownloadButton = getElement("download-report-button");
         configInput.value = JSON.stringify(exampleConfig, null, 2);
+        initializeStrategyControls(configInput);
         loadExampleButton.addEventListener("click", () => {
             configInput.value = JSON.stringify(exampleConfig, null, 2);
+            syncStrategyControlsFromConfig(configInput);
             setStatus("Example configuration loaded.");
         });
+        configInput.addEventListener("change", () => syncStrategyControlsFromConfig(configInput));
         runButton.addEventListener("click", () => {
             void runFromConfig(configInput.value);
         });
@@ -1337,6 +1554,52 @@ define("browser/app", ["require", "exports", "config/validate-config", "report/r
             if (latestRun)
                 downloadText("parking-tower-report.json", latestRun.reportJson, "application/json");
         });
+    }
+    function initializeStrategyControls(configInput) {
+        const descriptors = (0, strategy_registry_js_3.getStrategyDescriptors)();
+        for (const category of Object.keys(strategyControlIds)) {
+            const select = getElement(strategyControlIds[category]);
+            for (const descriptor of descriptors.filter((item) => item.category === category)) {
+                const option = document.createElement("option");
+                option.value = descriptor.type;
+                option.textContent = descriptor.label;
+                option.title = descriptor.description;
+                select.append(option);
+            }
+            select.addEventListener("change", () => updateConfigFromStrategyControls(configInput));
+        }
+        syncStrategyControlsFromConfig(configInput);
+    }
+    function syncStrategyControlsFromConfig(configInput) {
+        try {
+            const config = JSON.parse(configInput.value);
+            const strategies = (0, strategy_registry_js_3.normalizeGarageStrategyConfig)(config.garage?.strategies);
+            for (const category of Object.keys(strategyControlIds)) {
+                getElement(strategyControlIds[category]).value = strategies[category].type;
+            }
+        }
+        catch {
+            // Malformed JSON is reported when the user runs the simulation.
+        }
+    }
+    function updateConfigFromStrategyControls(configInput) {
+        try {
+            const config = JSON.parse(configInput.value);
+            config.garage.strategies = {
+                placement: { type: getElement(strategyControlIds.placement).value },
+                retrieval: { type: getElement(strategyControlIds.retrieval).value },
+                tripPlanner: { type: getElement(strategyControlIds.tripPlanner).value },
+                preparationPositions: {
+                    type: getElement(strategyControlIds.preparationPositions).value,
+                },
+                unblocking: { type: getElement(strategyControlIds.unblocking).value },
+            };
+            configInput.value = JSON.stringify(config, null, 2);
+            setStatus("Strategy selection updated.");
+        }
+        catch {
+            setStatus("Fix the configuration JSON before changing strategies.", true);
+        }
     }
     async function runFromConfig(configText) {
         setControlsDisabled(true);
@@ -1415,7 +1678,12 @@ define("browser/app", ["require", "exports", "config/validate-config", "report/r
         setDownloadButtonsEnabled(false);
     }
     function setControlsDisabled(disabled) {
-        for (const id of ["run-button", "load-example-button", "config-input"]) {
+        for (const id of [
+            "run-button",
+            "load-example-button",
+            "config-input",
+            ...Object.values(strategyControlIds),
+        ]) {
             getElement(id).disabled = disabled;
         }
     }
@@ -1454,168 +1722,4 @@ define("browser/app", ["require", "exports", "config/validate-config", "report/r
         }
         return element;
     }
-});
-define("report/jsonl-raw-simulation-reader", ["require", "exports", "node:fs/promises"], function (require, exports, promises_1) {
-    "use strict";
-    Object.defineProperty(exports, "__esModule", { value: true });
-    exports.JsonlRawSimulationReader = void 0;
-    class JsonlRawSimulationReader {
-        constructor(rawOutput) {
-            this.rawOutput = rawOutput;
-            this.lines = null;
-        }
-        async readMetadata() {
-            const lines = await this.readLines();
-            const metadata = lines.find((line) => line.kind === "metadata");
-            if (!metadata) {
-                throw new Error(`Raw output does not contain metadata: ${this.rawOutput.path}`);
-            }
-            return metadata;
-        }
-        async readRecords() {
-            const lines = await this.readLines();
-            return lines.filter((line) => line.kind !== "metadata");
-        }
-        async readLines() {
-            if (this.lines)
-                return this.lines;
-            const text = await (0, promises_1.readFile)(this.rawOutput.path, "utf8");
-            this.lines = text
-                .split("\n")
-                .filter((line) => line.trim().length > 0)
-                .map((line) => JSON.parse(line));
-            return this.lines;
-        }
-    }
-    exports.JsonlRawSimulationReader = JsonlRawSimulationReader;
-});
-define("report/json-report-generator", ["require", "exports", "node:fs/promises", "report/jsonl-raw-simulation-reader", "report/report-builder"], function (require, exports, promises_2, jsonl_raw_simulation_reader_js_1, report_builder_js_2) {
-    "use strict";
-    Object.defineProperty(exports, "__esModule", { value: true });
-    exports.JsonReportGenerator = void 0;
-    class JsonReportGenerator {
-        async generate(rawOutput, _config) {
-            const reader = new jsonl_raw_simulation_reader_js_1.JsonlRawSimulationReader(rawOutput);
-            const metadata = await reader.readMetadata();
-            const records = await reader.readRecords();
-            return (0, report_builder_js_2.buildReportFromRecords)(metadata, records, rawOutput);
-        }
-        async write(report, destination) {
-            await (0, promises_2.writeFile)(destination, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-        }
-    }
-    exports.JsonReportGenerator = JsonReportGenerator;
-});
-define("run-report", ["require", "exports", "report/json-report-generator"], function (require, exports, json_report_generator_js_1) {
-    "use strict";
-    Object.defineProperty(exports, "__esModule", { value: true });
-    async function main() {
-        const rawOutputPath = process.argv[2] ?? "output/example-3x3-baseline.jsonl";
-        const destinationPath = process.argv[3] ?? "output/example-3x3-report.json";
-        const generator = new json_report_generator_js_1.JsonReportGenerator();
-        const report = await generator.generate({ path: rawOutputPath }, { destinationPath });
-        await generator.write(report, destinationPath);
-        console.log(`Report complete: ${destinationPath}`);
-        console.log(`Daily rows: ${report.daily.length}`);
-        console.log(`Successful activities: ${report.thirtyDaySummary.sum.successfulActivities}`);
-        console.log(`Revenue: ${report.thirtyDaySummary.sum.totalRevenue}`);
-    }
-    main().catch((error) => {
-        console.error(error);
-        process.exitCode = 1;
-    });
-});
-define("config/json-config-loader", ["require", "exports", "node:fs/promises", "config/validate-config"], function (require, exports, promises_3, validate_config_js_2) {
-    "use strict";
-    Object.defineProperty(exports, "__esModule", { value: true });
-    exports.JsonConfigLoader = void 0;
-    class JsonConfigLoader {
-        async load(path) {
-            const text = await (0, promises_3.readFile)(path, "utf8");
-            const config = JSON.parse(text);
-            const validation = this.validate(config);
-            if (!validation.valid) {
-                throw new Error(`Invalid simulation config:\n${validation.errors.join("\n")}`);
-            }
-            return config;
-        }
-        validate(config) {
-            return (0, validate_config_js_2.validateSimulationConfig)(config);
-        }
-    }
-    exports.JsonConfigLoader = JsonConfigLoader;
-});
-define("simulation/jsonl-recorder", ["require", "exports", "node:fs/promises", "node:path", "simulation/compact-records"], function (require, exports, promises_4, node_path_1, compact_records_js_2) {
-    "use strict";
-    Object.defineProperty(exports, "__esModule", { value: true });
-    exports.JsonlSimulationStateRecorder = void 0;
-    class JsonlSimulationStateRecorder {
-        constructor() {
-            this.outputPath = "";
-            this.lastStateKey = "";
-        }
-        async open(session) {
-            await (0, promises_4.mkdir)(session.config.simulation.outputDir, { recursive: true });
-            this.outputPath = (0, node_path_1.join)(session.config.simulation.outputDir, session.config.simulation.rawOutputFile);
-            await (0, promises_4.writeFile)(this.outputPath, `${JSON.stringify({
-                kind: "metadata",
-                sessionId: session.id,
-                config: session.config,
-                recording: {
-                    schema: "compact-jsonl-v1",
-                    checkpointIntervalSeconds: compact_records_js_2.defaultCheckpointIntervalSeconds,
-                },
-            })}\n`, "utf8");
-        }
-        async recordSecond(record) {
-            const result = (0, compact_records_js_2.buildCompactRecords)(record, this.lastStateKey, compact_records_js_2.defaultCheckpointIntervalSeconds);
-            this.lastStateKey = result.stateKey;
-            const lines = result.records.map((compactRecord) => JSON.stringify(compactRecord));
-            if (lines.length > 0) {
-                await (0, promises_4.appendFile)(this.outputPath, `${lines.join("\n")}\n`, "utf8");
-            }
-        }
-        async close() {
-            return;
-        }
-        getOutputRef() {
-            return { path: this.outputPath };
-        }
-    }
-    exports.JsonlSimulationStateRecorder = JsonlSimulationStateRecorder;
-});
-define("simulation/default-runner", ["require", "exports", "config/json-config-loader", "simulation/jsonl-recorder", "simulation/session-factory", "simulation/simulation-engine"], function (require, exports, json_config_loader_js_1, jsonl_recorder_js_1, session_factory_js_2, simulation_engine_js_2) {
-    "use strict";
-    Object.defineProperty(exports, "__esModule", { value: true });
-    exports.DefaultSimulationRunner = void 0;
-    class DefaultSimulationRunner extends simulation_engine_js_2.SimulationEngine {
-        constructor() {
-            super(...arguments);
-            this.configLoader = new json_config_loader_js_1.JsonConfigLoader();
-        }
-        async initialize(configPath) {
-            const config = await this.configLoader.load(configPath);
-            return (0, session_factory_js_2.createSimulationSession)(config, new jsonl_recorder_js_1.JsonlSimulationStateRecorder());
-        }
-    }
-    exports.DefaultSimulationRunner = DefaultSimulationRunner;
-});
-define("run-simulation", ["require", "exports", "node:path", "simulation/default-runner"], function (require, exports, node_path_2, default_runner_js_1) {
-    "use strict";
-    Object.defineProperty(exports, "__esModule", { value: true });
-    async function main() {
-        const configPath = process.argv[2] ?? "config/example-3x3.json";
-        const runner = new default_runner_js_1.DefaultSimulationRunner();
-        const session = await runner.initialize((0, node_path_2.resolve)(configPath));
-        const result = await runner.run(session);
-        console.log(`Simulation complete: ${result.sessionId}`);
-        console.log(`Raw output: ${result.rawOutput.path}`);
-        console.log(`Final occupancy: ${result.finalSnapshot.occupancy.occupiedCount}/${result.finalSnapshot.occupancy.totalParkingCells}`);
-        console.log(`Inbound completed: ${result.finalSnapshot.counters.inboundCompleted}`);
-        console.log(`Outbound completed: ${result.finalSnapshot.counters.outboundCompleted}`);
-    }
-    main().catch((error) => {
-        console.error(error);
-        process.exitCode = 1;
-    });
 });

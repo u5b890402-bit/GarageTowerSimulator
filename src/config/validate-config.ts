@@ -1,4 +1,5 @@
 import type { SimulationConfig, ValidationResult } from "../domain/types.js";
+import { validateGarageStrategyConfig } from "../garage/strategy-registry.js";
 
 export function validateSimulationConfig(config: SimulationConfig): ValidationResult {
   const errors: string[] = [];
@@ -23,6 +24,7 @@ export function validateSimulationConfig(config: SimulationConfig): ValidationRe
     if (preparationPositions.inboundCount < 0 || preparationPositions.outboundCount < 0) {
       errors.push("preparation position counts cannot be negative.");
     }
+    errors.push(...validateGarageStrategyConfig(config.garage.strategies));
   }
 
   return { valid: errors.length === 0, errors };

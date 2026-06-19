@@ -1,6 +1,6 @@
 import type { GarageFactory, GarageStrategySet, SimulationConfig, SimulationSession, SimulationStateRecorder } from "../domain/types.js";
 import { SimpleGarageTowerSystem } from "../garage/simple-garage.js";
-import { createBaselineStrategies } from "../garage/strategies.js";
+import { createGarageStrategies } from "../garage/strategy-registry.js";
 import { SeededDemandGenerator } from "./demand-generator.js";
 import { SeededRandomSource } from "./random.js";
 
@@ -13,7 +13,7 @@ class SimpleGarageFactory implements GarageFactory {
 }
 
 export function createSimulationSession(config: SimulationConfig, recorder: SimulationStateRecorder): SimulationSession {
-  const strategies = createBaselineStrategies();
+  const strategies = createGarageStrategies(config.garage.strategies);
   const garage = new SimpleGarageFactory().createGarage(config.garage, strategies);
   const demandGenerator = new SeededDemandGenerator();
   demandGenerator.initialize(config.demand, config.simulation.seed);

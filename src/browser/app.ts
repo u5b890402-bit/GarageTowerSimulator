@@ -1,5 +1,16 @@
-import type { SimulationConfig, SimulationResult, SimulationSession, SimTime, ThirtyDayReportSummary } from "../domain/types.js";
+import type {
+  SimulationConfig,
+  SimulationResult,
+  SimulationSession,
+  SimTime,
+  StrategyCategory,
+  ThirtyDayReportSummary,
+} from "../domain/types.js";
 import { validateSimulationConfig } from "../config/validate-config.js";
+import {
+  getStrategyDescriptors,
+  normalizeGarageStrategyConfig,
+} from "../garage/strategy-registry.js";
 import { buildReportFromRecords } from "../report/report-builder.js";
 import { InMemorySimulationStateRecorder } from "../simulation/in-memory-recorder.js";
 import { createSimulationSession } from "../simulation/session-factory.js";
@@ -66,6 +77,13 @@ const exampleConfig: SimulationConfig = {
       sequentialClearSeconds: 80,
       doorSeconds: 5,
     },
+    strategies: {
+      placement: { type: "lowest-access-cost" },
+      retrieval: { type: "simple-retrieval" },
+      tripPlanner: { type: "single-operation" },
+      preparationPositions: { type: "fixed-assignment" },
+      unblocking: { type: "disabled" },
+    },
   },
 };
 
@@ -78,6 +96,14 @@ interface BrowserRunResult {
 
 let latestRun: BrowserRunResult | null = null;
 
+const strategyControlIds: Record<StrategyCategory, string> = {
+  placement: "placement-strategy",
+  retrieval: "retrieval-strategy",
+  tripPlanner: "trip-planner-strategy",
+  preparationPositions: "pp-strategy",
+  unblocking: "unblocking-strategy",
+};
+
 export function startApp(): void {
   const configInput = getElement<HTMLTextAreaElement>("config-input");
   const runButton = getElement<HTMLButtonElement>("run-button");
@@ -86,11 +112,15 @@ export function startApp(): void {
   const reportDownloadButton = getElement<HTMLButtonElement>("download-report-button");
 
   configInput.value = JSON.stringify(exampleConfig, null, 2);
+  initializeStrategyControls(configInput);
 
   loadExampleButton.addEventListener("click", () => {
     configInput.value = JSON.stringify(exampleConfig, null, 2);
+    syncStrategyControlsFromConfig(configInput);
     setStatus("Example configuration loaded.");
   });
+
+  configInput.addEventListener("change", () => syncStrategyControlsFromConfig(configInput));
 
   runButton.addEventListener("click", () => {
     void runFromConfig(configInput.value);
@@ -103,6 +133,55 @@ export function startApp(): void {
   reportDownloadButton.addEventListener("click", () => {
     if (latestRun) downloadText("parking-tower-report.json", latestRun.reportJson, "application/json");
   });
+}
+
+function initializeStrategyControls(configInput: HTMLTextAreaElement): void {
+  const descriptors = getStrategyDescriptors();
+
+  for (const category of Object.keys(strategyControlIds) as StrategyCategory[]) {
+    const select = getElement<HTMLSelectElement>(strategyControlIds[category]);
+    for (const descriptor of descriptors.filter((item) => item.category === category)) {
+      const option = document.createElement("option");
+      option.value = descriptor.type;
+      option.textContent = descriptor.label;
+      option.title = descriptor.description;
+      select.append(option);
+    }
+    select.addEventListener("change", () => updateConfigFromStrategyControls(configInput));
+  }
+
+  syncStrategyControlsFromConfig(configInput);
+}
+
+function syncStrategyControlsFromConfig(configInput: HTMLTextAreaElement): void {
+  try {
+    const config = JSON.parse(configInput.value) as SimulationConfig;
+    const strategies = normalizeGarageStrategyConfig(config.garage?.strategies);
+    for (const category of Object.keys(strategyControlIds) as StrategyCategory[]) {
+      getElement<HTMLSelectElement>(strategyControlIds[category]).value = strategies[category].type;
+    }
+  } catch {
+    // Malformed JSON is reported when the user runs the simulation.
+  }
+}
+
+function updateConfigFromStrategyControls(configInput: HTMLTextAreaElement): void {
+  try {
+    const config = JSON.parse(configInput.value) as SimulationConfig;
+    config.garage.strategies = {
+      placement: { type: getElement<HTMLSelectElement>(strategyControlIds.placement).value },
+      retrieval: { type: getElement<HTMLSelectElement>(strategyControlIds.retrieval).value },
+      tripPlanner: { type: getElement<HTMLSelectElement>(strategyControlIds.tripPlanner).value },
+      preparationPositions: {
+        type: getElement<HTMLSelectElement>(strategyControlIds.preparationPositions).value,
+      },
+      unblocking: { type: getElement<HTMLSelectElement>(strategyControlIds.unblocking).value },
+    };
+    configInput.value = JSON.stringify(config, null, 2);
+    setStatus("Strategy selection updated.");
+  } catch {
+    setStatus("Fix the configuration JSON before changing strategies.", true);
+  }
 }
 
 async function runFromConfig(configText: string): Promise<void> {
@@ -192,7 +271,12 @@ function clearSummary(): void {
 }
 
 function setControlsDisabled(disabled: boolean): void {
-  for (const id of ["run-button", "load-example-button", "config-input"]) {
+  for (const id of [
+    "run-button",
+    "load-example-button",
+    "config-input",
+    ...Object.values(strategyControlIds),
+  ]) {
     getElement<HTMLInputElement | HTMLButtonElement | HTMLTextAreaElement>(id).disabled = disabled;
   }
 }

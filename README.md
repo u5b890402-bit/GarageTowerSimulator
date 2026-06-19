@@ -126,6 +126,7 @@ public/index.html
 The browser app lets the user:
 
 - Load the example configuration.
+- Select registered garage strategies from dropdowns.
 - Edit configuration JSON directly.
 - Run a simulation.
 - See a summary of key report metrics.
@@ -193,9 +194,52 @@ Top-level sections:
 
 - `simulation`: session timing, seed, output file, revenue policy, balking policy.
 - `demand`: random inbound/outbound demand assumptions.
-- `garage`: layout, elevator, VMR, and preparation-position configuration.
+- `garage`: layout, elevator, VMR, preparation-position, and strategy configuration.
 
 The simulation uses a seeded random source. Given the same config and seed, the same demand pattern should be generated.
+
+### Strategy Selection
+
+Garage strategy implementations are selected with stable IDs under `garage.strategies`:
+
+```json
+{
+  "garage": {
+    "strategies": {
+      "placement": {
+        "type": "lowest-access-cost"
+      },
+      "retrieval": {
+        "type": "simple-retrieval"
+      },
+      "tripPlanner": {
+        "type": "single-operation"
+      },
+      "preparationPositions": {
+        "type": "fixed-assignment"
+      },
+      "unblocking": {
+        "type": "disabled"
+      }
+    }
+  }
+}
+```
+
+Available strategy IDs:
+
+| Category | ID | Behavior |
+| --- | --- | --- |
+| Placement | `lowest-access-cost` | Chooses the empty cell with the lowest estimated access cost. |
+| Placement | `first-available` | Chooses the first empty cell in layout order. |
+| Retrieval | `simple-retrieval` | Baseline retrieval classification and cost estimate. |
+| Trip planner | `single-operation` | Baseline one-operation-at-a-time behavior. |
+| Preparation positions | `fixed-assignment` | Keeps configured inbound/outbound assignments fixed. |
+| Unblocking | `disabled` | Does not initiate idle unblocking. |
+
+The `strategies` section is optional for backward compatibility. When omitted, the defaults shown above are used.
+
+Unknown strategy IDs and unsupported options are rejected before the simulation starts. Strategy implementations are selected from an explicit registry; config files cannot load arbitrary JavaScript files or class names.
 
 ## Raw Output Format
 
