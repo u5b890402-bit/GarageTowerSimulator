@@ -1,7 +1,5 @@
 import type {
   CellId,
-  ElevatorTripPlan,
-  ElevatorTripPlanner,
   PlacementContext,
   PlacementStrategy,
   PreparationPositionAssignment,
@@ -25,6 +23,7 @@ export class LowestCostPlacementStrategy implements PlacementStrategy {
     return context.layout
       .getParkingCells()
       .filter((cellId) => !occupied.has(cellId))
+      .filter((cellId) => !context.layout.wouldCreateBlockedEmptyCell(cellId, context.occupancy))
       .map((cellId) => ({
         cellId,
         score: context.layout.estimateAccessCost(cellId, context.occupancy),
@@ -44,6 +43,7 @@ export class FirstAvailablePlacementStrategy implements PlacementStrategy {
     return context.layout
       .getParkingCells()
       .filter((cellId) => !occupied.has(cellId))
+      .filter((cellId) => !context.layout.wouldCreateBlockedEmptyCell(cellId, context.occupancy))
       .map((cellId, index) => ({
         cellId,
         score: index,
@@ -79,12 +79,6 @@ export class SimpleRetrievalStrategy implements RetrievalStrategy {
   }
 }
 
-export class NoopElevatorTripPlanner implements ElevatorTripPlanner {
-  planNextTrip(): ElevatorTripPlan | null {
-    return null;
-  }
-}
-
 export class FixedPreparationPositionPolicy implements PreparationPositionPolicy {
   chooseAssignments(context: PreparationPositionContext): PreparationPositionAssignment {
     const inboundPositionIds = context.snapshot.preparationPositions
@@ -104,5 +98,15 @@ export class NoopUnblockingStrategy implements UnblockingStrategy {
 
   planUnblocking(_context: UnblockingContext): UnblockingPlan | null {
     return null;
+  }
+}
+
+export class IdleAfterTenMinutesUnblockingStrategy implements UnblockingStrategy {
+  shouldStartIdleUnblocking(context: UnblockingContext): boolean {
+    return context.idleSeconds >= 600;
+  }
+
+  planUnblocking(_context: UnblockingContext): UnblockingPlan | null {
+    return { operations: [] };
   }
 }

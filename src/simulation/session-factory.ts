@@ -16,7 +16,7 @@ export function createSimulationSession(config: SimulationConfig, recorder: Simu
   const strategies = createGarageStrategies(config.garage.strategies);
   const garage = new SimpleGarageFactory().createGarage(config.garage, strategies);
   const demandGenerator = new SeededDemandGenerator();
-  demandGenerator.initialize(config.demand, config.simulation.seed);
+  demandGenerator.initialize(config.demand, config.simulation, config.simulation.seed);
 
   return {
     id: `${config.simulation.sessionName}-${config.simulation.seed}`,

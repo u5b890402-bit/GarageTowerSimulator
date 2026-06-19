@@ -1,6 +1,11 @@
 import type {
   CapacityInfo,
+  CellId,
   CellOccupancy,
+  ElevatorTripAction,
+  ElevatorTripActionGroup,
+  ElevatorDeckState,
+  ElevatorTripState,
   EventAcceptanceResult,
   GarageCompletedOperation,
   GarageConfig,
@@ -12,102 +17,129 @@ import type {
   GarageTickContext,
   GarageTickResult,
   GarageTowerSystem,
+  OccupancyState,
   PreparationPositionState,
   QueuedVehicle,
   SimTime,
   VehicleId,
+  VmrPath,
   VmrState,
 } from "../domain/types.js";
 import { GridGarageLayout } from "./grid-layout.js";
+import { GridVmrPathPlanner } from "./vmr-path-planner.js";
 
 interface ParkedVehicleRecord {
   vehicleId: VehicleId;
-  cellId: string;
+  cellId: CellId;
   parkedAt: SimTime;
+}
+
+interface ActiveActionGroup {
+  group: ElevatorTripActionGroup;
+  operations: GarageOperation[];
+  completesAt: SimTime;
+}
+
+interface PhysicalTrip {
+  state: ElevatorTripState;
+  groups: ElevatorTripActionGroup[];
+  groupIndex: number;
+  activeGroup: ActiveActionGroup | null;
 }
 
 export class SimpleGarageTowerSystem implements GarageTowerSystem {
   private layout!: GridGarageLayout;
+  private pathPlanner!: GridVmrPathPlanner;
   private config!: GarageConfig;
   private inboundQueue: QueuedVehicle[] = [];
   private outboundQueue: QueuedVehicle[] = [];
   private parked = new Map<VehicleId, ParkedVehicleRecord>();
   private requestedOutbound = new Set<VehicleId>();
   private preparationPositions: PreparationPositionState[] = [];
-  private activeOperation: GarageOperation | null = null;
-  private operationDuration = 0;
+  private decks: ElevatorDeckState[] = [];
   private vmrs: VmrState[] = [];
-  private counters: GarageCumulativeCounters = {
-    inboundAccepted: 0,
-    outboundAccepted: 0,
-    inboundBalked: 0,
-    inboundCompleted: 0,
-    outboundCompleted: 0,
-    rejectedEvents: 0,
-    maxInboundQueueLength: 0,
-    maxOutboundQueueLength: 0,
-    elevatorFloorsPassed: 0,
-    vmrDistanceMeters: 0,
-    inducedInboundTrips: 0,
-    inducedInboundVehicles: 0,
-    idleUnblockingActions: 0,
-    idleUnblockedVehicles: 0,
-    downwardTripPlacements: 0,
-  };
+  private trip: PhysicalTrip | null = null;
+  private elevatorFloor = 1;
+  private elevatorDirection: "up" | "down" | "stopped" = "stopped";
+  private lastExternalActivityAt = 0;
+  private counters: GarageCumulativeCounters = this.newCounters();
 
   constructor(private readonly strategies: GarageStrategySet) {}
 
   initialize(config: GarageConfig): void {
     this.config = config;
     this.layout = new GridGarageLayout(config.layout);
+    this.pathPlanner = new GridVmrPathPlanner(config, this.layout);
+    this.inboundQueue = [];
+    this.outboundQueue = [];
+    this.parked.clear();
+    this.requestedOutbound.clear();
+    this.trip = null;
+    this.elevatorFloor = 1;
+    this.elevatorDirection = "stopped";
+    this.lastExternalActivityAt = 0;
+    this.counters = this.newCounters();
     this.preparationPositions = [
       ...Array.from({ length: config.preparationPositions.inboundCount }, (_, index) => ({
         id: `IPP${index + 1}`,
         direction: "inbound" as const,
+        doorState: "open" as const,
       })),
       ...Array.from({ length: config.preparationPositions.outboundCount }, (_, index) => ({
         id: `OPP${index + 1}`,
         direction: "outbound" as const,
+        doorState: "closed" as const,
       })),
     ];
-    this.vmrs = Array.from({ length: config.elevator.deckCount }, (_, index) => ({
-      id: `VMR${index + 1}`,
-      deckId: `D${index + 1}`,
+    this.decks = Array.from({ length: config.elevator.deckCount }, (_, index) => ({
+      id: `D${index + 1}`,
+      index,
+      alignedFloor: 1 - index,
+      orientation: "garage",
+      vmrId: `VMR${index + 1}`,
+    }));
+    this.vmrs = this.decks.map((deck) => ({
+      id: deck.vmrId,
+      deckId: deck.id,
+      homeDeckId: deck.id,
       status: "Idle",
       distanceMovedMeters: 0,
     }));
   }
 
   submitEvents(context: GarageEventIntakeContext): EventAcceptanceResult[] {
-    const results: EventAcceptanceResult[] = [];
-
-    for (const event of context.events) {
-      if (event.type === "InboundArrival") {
-        results.push(this.submitInbound(event.id, event.vehicleId, context));
-      } else {
-        results.push(this.submitOutbound(event.id, event.vehicleId, context.time));
-      }
+    if (context.events.length > 0) {
+      this.lastExternalActivityAt = context.time;
     }
-
+    const results = context.events.map((event) =>
+      event.type === "InboundArrival"
+        ? this.submitInbound(event.id, event.vehicleId, context)
+        : this.submitOutbound(event.id, event.vehicleId, context.time),
+    );
     this.updateMaxQueues();
     return results;
   }
 
   updateOneSecond(context: GarageTickContext): GarageTickResult {
-    this.clearReadyOutboundPreparationPositions(context.time);
-    this.fillInboundPreparationPositions(context.time);
+    this.updatePreparationPositions(context.time);
 
-    const completedOperations: GarageCompletedOperation[] = [];
-    if (this.activeOperation && context.time >= this.activeOperation.completesAt) {
-      completedOperations.push(this.completeActiveOperation(context.time));
+    const completedOperations = this.fillInboundPreparationPositions(context.time);
+    const startedOperations: GarageOperation[] = [];
+
+    if (this.trip?.activeGroup && context.time >= this.trip.activeGroup.completesAt) {
+      completedOperations.push(...this.completeActiveGroup(context.time));
     }
 
-    const startedOperations: GarageOperation[] = [];
-    if (!this.activeOperation) {
-      const nextOperation = this.startNextOperation(context);
-      if (nextOperation) {
-        startedOperations.push(nextOperation);
-      }
+    if (this.trip && !this.trip.activeGroup && this.trip.groupIndex >= this.trip.groups.length) {
+      this.finishTrip(context.time);
+    }
+
+    if (!this.trip) {
+      this.trip = this.planTrip(context);
+    }
+
+    if (this.trip && !this.trip.activeGroup) {
+      startedOperations.push(...this.startNextGroup(context));
     }
 
     this.updateMaxQueues();
@@ -116,12 +148,14 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
 
   getSnapshot(): GarageStateSnapshot {
     const occupancy = this.getOccupancy();
-    const elevator = {
-      status: this.activeOperation ? "Busy" as const : "IdleAtHome" as const,
-      currentFloor: this.activeOperation ? this.estimateOperationFloor(this.activeOperation) : 1,
-      deckCount: this.config.elevator.deckCount,
-      ...(this.activeOperation ? { activeOperationId: this.activeOperation.id } : {}),
-    };
+    const activeOperations = this.trip?.activeGroup?.operations.map((operation) => ({ ...operation })) ?? [];
+    const activeTrip = this.trip
+      ? {
+          ...this.trip.state,
+          phase: this.trip.activeGroup?.group.name ?? "planning",
+          routeIndex: this.trip.groupIndex,
+        }
+      : undefined;
 
     return {
       time: 0,
@@ -132,16 +166,35 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
         inboundLength: this.inboundQueue.length,
         outboundLength: this.outboundQueue.length,
       },
-      elevator,
+      elevator: {
+        status: this.trip ? "Busy" : "IdleAtHome",
+        currentFloor: this.elevatorFloor,
+        deckCount: this.decks.length,
+        direction: this.elevatorDirection,
+        decks: this.decks.map((deck) => ({
+          ...deck,
+          alignedFloor: this.elevatorFloor - deck.index,
+        })),
+        ...(activeTrip ? { activeTrip } : {}),
+        ...(activeOperations[0] ? { activeOperationId: activeOperations[0].id } : {}),
+      },
       preparationPositions: this.preparationPositions.map((position) => ({ ...position })),
-      vmrs: this.vmrs.map((vmr) => ({ ...vmr })),
+      vmrs: this.vmrs.map((vmr) => ({
+        ...vmr,
+        ...(vmr.currentTask ? { currentTask: { ...vmr.currentTask } } : {}),
+      })),
       counters: { ...this.counters },
-      activeOperations: this.activeOperation ? [{ ...this.activeOperation }] : [],
+      activeOperations,
     };
   }
 
   isIdle(): boolean {
-    return !this.activeOperation && this.inboundQueue.length === 0 && this.outboundQueue.length === 0;
+    return (
+      !this.trip &&
+      this.inboundQueue.length === 0 &&
+      this.outboundQueue.length === 0 &&
+      !this.preparationPositions.some((position) => position.occupiedBy)
+    );
   }
 
   getCapacity(): CapacityInfo {
@@ -158,21 +211,20 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
     vehicleId: VehicleId,
     context: GarageEventIntakeContext,
   ): EventAcceptanceResult {
-    const capacity = this.getCapacity();
-    const inboundInSystem = this.inboundQueue.length + this.occupiedInboundPreparationPositions().length;
-    if (capacity.availableParkingCells <= inboundInSystem) {
+    const available = this.getCapacity().availableParkingCells;
+    const reservedInbound = this.inboundQueue.length + this.inboundVehiclesInPhysicalSystem();
+    if (available <= reservedInbound) {
       this.counters.rejectedEvents += 1;
       return {
         eventId,
         vehicleId,
         accepted: false,
         outcome: "RejectedGarageFull",
-        reason: "No parking cell is available for another inbound vehicle.",
+        reason: "No unreserved parking cell is available for another inbound vehicle.",
       };
     }
 
-    const queueLengthExcludingPps = this.inboundQueue.length;
-    if (this.shouldBalk(queueLengthExcludingPps, context)) {
+    if (this.shouldBalk(this.inboundQueue.length, context)) {
       this.counters.inboundBalked += 1;
       return {
         eventId,
@@ -194,7 +246,11 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
     };
   }
 
-  private submitOutbound(eventId: string, vehicleId: VehicleId, time: SimTime): EventAcceptanceResult {
+  private submitOutbound(
+    eventId: string,
+    vehicleId: VehicleId,
+    time: SimTime,
+  ): EventAcceptanceResult {
     if (!this.parked.has(vehicleId)) {
       this.counters.rejectedEvents += 1;
       return {
@@ -205,7 +261,6 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
         reason: "Vehicle is not currently parked.",
       };
     }
-
     if (this.requestedOutbound.has(vehicleId)) {
       this.counters.rejectedEvents += 1;
       return {
@@ -229,206 +284,461 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
     };
   }
 
-  private startNextOperation(context: GarageTickContext): GarageOperation | null {
-    const readyInbound = this.preparationPositions.find(
-      (position) => position.direction === "inbound" && position.occupiedBy && (position.readyAt ?? 0) <= context.time,
-    );
-    if (readyInbound?.occupiedBy) {
-      return this.startParkingOperation(readyInbound, context);
-    }
-
-    if (this.outboundQueue.length > 0) {
-      return this.startRetrievalOperation(context);
-    }
-
-    return null;
-  }
-
-  private startParkingOperation(position: PreparationPositionState, context: GarageTickContext): GarageOperation | null {
-    const vehicleId = position.occupiedBy;
-    if (!vehicleId) return null;
-
-    const cellId = this.strategies.placementStrategy.chooseCell(
-      vehicleId,
-      { time: context.time, layout: this.layout, occupancy: this.getOccupancy() },
-      context.rng,
-    );
-    if (!cellId) return null;
-
-    delete position.occupiedBy;
-    delete position.readyAt;
-
-    const duration = this.estimateParkingSeconds(cellId);
-    const operation: GarageOperation = {
-      id: `op-${context.time}-${vehicleId}`,
-      type: "ParkInbound",
-      vehicleId,
-      startedAt: context.time,
-      completesAt: context.time + duration,
-      from: position.id,
-      to: cellId,
-    };
-    this.activateOperation(operation, duration, cellId);
-    context.telemetry.recordOperation({
-      time: context.time,
-      type: "ParkInboundStarted",
-      vehicleId,
-      detail: { cellId, duration },
-    });
-    return operation;
-  }
-
-  private startRetrievalOperation(context: GarageTickContext): GarageOperation | null {
-    const next = this.outboundQueue.shift();
-    if (!next) return null;
-
-    const parked = this.parked.get(next.vehicleId);
-    if (!parked) {
-      this.requestedOutbound.delete(next.vehicleId);
-      return null;
-    }
-
-    const duration = this.estimateRetrievalSeconds(parked.cellId);
-    const operation: GarageOperation = {
-      id: `op-${context.time}-${next.vehicleId}`,
-      type: "RetrieveOutbound",
-      vehicleId: next.vehicleId,
-      startedAt: context.time,
-      completesAt: context.time + duration,
-      from: parked.cellId,
-      to: "outbound-preparation-position",
-    };
-    this.activateOperation(operation, duration, parked.cellId);
-    context.telemetry.recordOperation({
-      time: context.time,
-      type: "RetrieveOutboundStarted",
-      vehicleId: next.vehicleId,
-      detail: { cellId: parked.cellId, duration },
-    });
-    return operation;
-  }
-
-  private completeActiveOperation(time: SimTime): GarageCompletedOperation {
-    const operation = this.activeOperation;
-    if (!operation) {
-      throw new Error("No active operation to complete.");
-    }
-
-    this.activeOperation = null;
-    this.vmrs = this.vmrs.map((vmr) => ({ ...vmr, status: "Idle" }));
-
-    if (operation.type === "ParkInbound" && operation.vehicleId && operation.to) {
-      this.parked.set(operation.vehicleId, {
-        vehicleId: operation.vehicleId,
-        cellId: operation.to,
-        parkedAt: time,
+  private planTrip(context: GarageTickContext): PhysicalTrip | null {
+    const snapshot = this.getSnapshot();
+    snapshot.time = context.time;
+    const idleSeconds = context.time - this.lastExternalActivityAt;
+    const idleUnblockingAllowed =
+      this.strategies.unblockingStrategy.shouldStartIdleUnblocking({
+        time: context.time,
+        snapshot,
+        idleSeconds,
       });
-      this.counters.inboundCompleted += 1;
-    }
+    const plan = this.strategies.tripPlanner.planNextTrip({
+      time: context.time,
+      snapshot,
+      config: this.config,
+      layout: this.layout,
+      pathPlanner: this.pathPlanner,
+      placementStrategy: this.strategies.placementStrategy,
+      idleSeconds,
+      idleUnblockingAllowed,
+    });
+    if (!plan) return null;
 
-    if (operation.type === "RetrieveOutbound" && operation.vehicleId) {
-      this.parked.delete(operation.vehicleId);
-      this.requestedOutbound.delete(operation.vehicleId);
-      this.placeVehicleOnOutboundPreparationPosition(operation.vehicleId, time);
-      this.counters.outboundCompleted += 1;
-    }
-
-    return {
-      type: operation.type,
-      durationSeconds: this.operationDuration,
-      detail: { from: operation.from, to: operation.to },
-      ...(operation.vehicleId ? { vehicleId: operation.vehicleId } : {}),
-    };
-  }
-
-  private activateOperation(operation: GarageOperation, duration: number, cellId: string): void {
-    this.activeOperation = operation;
-    this.operationDuration = duration;
-    this.vmrs = this.vmrs.map((vmr, index) => ({
-      ...vmr,
-      status: index === 0 ? "Busy" : vmr.status,
-    }));
-
-    const floor = this.layout.getCellFloor(cellId);
-    const floorsPassed = Math.max(0, (floor - 1) * 2);
-    const vmrDistance = this.layout.estimateAccessCost(cellId, this.getOccupancy()) / 2;
-    this.counters.elevatorFloorsPassed += floorsPassed;
-    this.counters.vmrDistanceMeters += vmrDistance;
-    this.vmrs[0] = {
-      ...(this.vmrs[0] as VmrState),
-      distanceMovedMeters: (this.vmrs[0]?.distanceMovedMeters ?? 0) + vmrDistance,
-    };
-  }
-
-  private fillInboundPreparationPositions(time: SimTime): void {
-    for (const position of this.preparationPositions) {
-      if (this.inboundQueue.length === 0) return;
-      if (position.direction !== "inbound" || position.occupiedBy) continue;
-
-      const next = this.inboundQueue.shift();
-      if (!next) return;
-      position.occupiedBy = next.vehicleId;
-      position.readyAt = time + this.preparationClearSeconds();
-    }
-  }
-
-  private placeVehicleOnOutboundPreparationPosition(vehicleId: VehicleId, time: SimTime): void {
-    const openPosition = this.preparationPositions.find(
-      (position) => position.direction === "outbound" && !position.occupiedBy,
+    const selectedOutboundIds = new Set(plan.selectedOutboundVehicleIds);
+    this.outboundQueue = this.outboundQueue.filter(
+      (queued) => !selectedOutboundIds.has(queued.vehicleId),
     );
-    if (!openPosition) {
+    if (plan.inducedInboundVehicles > 0) {
+      this.counters.inducedInboundTrips += 1;
+      this.counters.inducedInboundVehicles += plan.inducedInboundVehicles;
+    }
+    return {
+      state: {
+        id: plan.id,
+        phase: plan.phase,
+        startedAt: context.time,
+        route: plan.stops,
+        routeIndex: 0,
+        inboundVehicleIds: plan.inboundVehicleIds,
+        outboundVehicleIds: plan.outboundVehicleIds,
+      },
+      groups: plan.groups,
+      groupIndex: 0,
+      activeGroup: null,
+    };
+  }
+
+  private startNextGroup(context: GarageTickContext): GarageOperation[] {
+    if (!this.trip) return [];
+    const group = this.trip.groups[this.trip.groupIndex];
+    if (!group) return [];
+    if (group.name.startsWith("move-elevator-") && !this.allVmrsHomeAndIdle()) {
+      context.telemetry.recordWarning({
+        time: context.time,
+        message: "Elevator movement delayed until all VMRs return to their home decks.",
+      });
+      return [];
+    }
+    this.validateActionGroupPaths(group);
+
+    if (group.elevatorDirection) {
+      this.elevatorDirection = group.elevatorDirection;
+    }
+    const operations = group.actions.map((action, index) => {
+      this.applyActionStart(action, context.time);
+      const operation: GarageOperation = {
+        id: `${this.trip?.state.id}-${this.trip?.groupIndex}-${index}`,
+        type: action.type,
+        startedAt: context.time,
+        completesAt: context.time + action.durationSeconds,
+        ...(action.vehicleId ? { vehicleId: action.vehicleId } : {}),
+        ...(action.from ? { from: action.from } : {}),
+        ...(action.to ? { to: action.to } : {}),
+        ...(action.path ? { path: action.path } : {}),
+      };
+      if (action.deckIndex !== undefined && action.type !== "RotateDeck") {
+        this.startVmrTask(action.deckIndex, operation);
+      }
+      context.telemetry.recordOperation({
+        time: context.time,
+        type: `${action.type}Started`,
+        ...(action.vehicleId ? { vehicleId: action.vehicleId } : {}),
+        detail: {
+          tripId: this.trip?.state.id,
+          group: group.name,
+          from: action.from,
+          to: action.to,
+          durationSeconds: action.durationSeconds,
+          path: action.path?.locations,
+        },
+      });
+      return operation;
+    });
+    const completesAt = Math.max(...operations.map((operation) => operation.completesAt));
+    this.trip.activeGroup = { group, operations, completesAt };
+    return operations;
+  }
+
+  private completeActiveGroup(time: SimTime): GarageCompletedOperation[] {
+    if (!this.trip?.activeGroup) return [];
+    const { group, operations } = this.trip.activeGroup;
+    group.actions.forEach((action) => {
+      this.applyActionComplete(action, time);
+      if (action.deckIndex !== undefined && action.type !== "RotateDeck") {
+        this.finishVmrTask(action.deckIndex);
+      }
+    });
+    const completed = operations.map((operation) => ({
+      type: operation.type,
+      durationSeconds: operation.completesAt - operation.startedAt,
+      detail: {
+        from: operation.from,
+        to: operation.to,
+        group: group.name,
+        path: operation.path?.locations,
+      },
+      ...(operation.vehicleId ? { vehicleId: operation.vehicleId } : {}),
+    }));
+    this.trip.activeGroup = null;
+    this.trip.groupIndex += 1;
+    return completed;
+  }
+
+  private finishTrip(time: SimTime): void {
+    if (!this.trip) return;
+    const wasNormalTrip =
+      this.trip.state.inboundVehicleIds.length > 0 ||
+      this.trip.state.outboundVehicleIds.length > 0;
+    this.elevatorFloor = 1;
+    this.elevatorDirection = "stopped";
+    for (const deck of this.decks) {
+      deck.alignedFloor = 1 - deck.index;
+      deck.orientation = "garage";
+    }
+    for (const vmr of this.vmrs) {
+      vmr.status = "Idle";
+      delete vmr.currentTask;
+    }
+    if (wasNormalTrip) {
+      this.lastExternalActivityAt = Math.max(this.lastExternalActivityAt, time);
+    }
+    this.trip = null;
+  }
+
+  private applyActionStart(action: ElevatorTripAction, time: SimTime): void {
+    if (
+      action.type !== "OperateDoor" ||
+      !action.preparationPositionId ||
+      !action.doorFinalState
+    ) {
       return;
     }
-    openPosition.occupiedBy = vehicleId;
-    openPosition.readyAt = time + this.preparationClearSeconds();
+    const position = this.findPp(action.preparationPositionId);
+    if (!position) return;
+    position.doorState =
+      action.doorFinalState === "open" ? "opening" : "closing";
+    position.doorTransitionCompleteAt = time + action.durationSeconds;
   }
 
-  private clearReadyOutboundPreparationPositions(time: SimTime): void {
+  private applyActionComplete(action: ElevatorTripAction, time: SimTime): void {
+    const deck =
+      action.deckIndex === undefined ? undefined : this.decks[action.deckIndex];
+
+    switch (action.type) {
+      case "MoveElevator": {
+        const from = this.elevatorPosition(action.from);
+        const to = this.elevatorPosition(action.to);
+        this.counters.elevatorFloorsPassed += Math.abs(to - from);
+        this.elevatorFloor = to;
+        this.decks.forEach((candidate) => {
+          candidate.alignedFloor = to - candidate.index;
+        });
+        break;
+      }
+      case "RotateDeck":
+        if (deck && (action.to === "garage" || action.to === "street")) {
+          deck.orientation = action.to;
+        }
+        break;
+      case "OperateDoor": {
+        const position = action.preparationPositionId
+          ? this.findPp(action.preparationPositionId)
+          : undefined;
+        if (!position || !action.doorFinalState) break;
+        position.doorState = action.doorFinalState;
+        delete position.doorTransitionCompleteAt;
+        if (action.setDriverReady && position.occupiedBy) {
+          position.readyAt = time + this.preparationClearSeconds();
+        }
+        break;
+      }
+      case "LoadInbound": {
+        const position = action.preparationPositionId
+          ? this.findPp(action.preparationPositionId)
+          : undefined;
+        if (position) {
+          delete position.occupiedBy;
+          delete position.readyAt;
+        }
+        if (deck && action.vehicleId) {
+          deck.vehicleId = action.vehicleId;
+          deck.vehicleRole = "inbound";
+        }
+        break;
+      }
+      case "MoveBlocker":
+        if (action.vehicleId) {
+          this.parked.delete(action.vehicleId);
+          if (deck) {
+            deck.vehicleId = action.vehicleId;
+            deck.vehicleRole = "blocker";
+          }
+        }
+        break;
+      case "LoadOutbound":
+        if (action.vehicleId) {
+          this.parked.delete(action.vehicleId);
+          if (deck) {
+            deck.vehicleId = action.vehicleId;
+            deck.vehicleRole = "outbound";
+          }
+        }
+        break;
+      case "RelocateBlocker":
+        if (action.vehicleId && action.to) {
+          this.parked.set(action.vehicleId, {
+            vehicleId: action.vehicleId,
+            cellId: action.to as CellId,
+            parkedAt: time,
+          });
+        }
+        if (action.deckIndex !== undefined) this.clearDeck(action.deckIndex);
+        break;
+      case "ParkInbound":
+        if (action.vehicleId && action.to) {
+          this.parked.set(action.vehicleId, {
+            vehicleId: action.vehicleId,
+            cellId: action.to as CellId,
+            parkedAt: time,
+          });
+          this.counters.inboundCompleted += 1;
+          this.counters.downwardTripPlacements += 1;
+        }
+        if (action.deckIndex !== undefined) this.clearDeck(action.deckIndex);
+        break;
+      case "RetrieveOutbound": {
+        const position = action.preparationPositionId
+          ? this.findPp(action.preparationPositionId)
+          : undefined;
+        if (position && action.vehicleId) {
+          position.occupiedBy = action.vehicleId;
+          position.doorState = "closed";
+        }
+        if (action.deckIndex !== undefined) this.clearDeck(action.deckIndex);
+        if (action.vehicleId) {
+          this.requestedOutbound.delete(action.vehicleId);
+          this.counters.outboundCompleted += 1;
+        }
+        break;
+      }
+      case "IdleUnblock":
+        if (action.vehicleId && action.to) {
+          this.parked.set(action.vehicleId, {
+            vehicleId: action.vehicleId,
+            cellId: action.to as CellId,
+            parkedAt: time,
+          });
+          this.counters.idleUnblockingActions += 1;
+          this.counters.idleUnblockedVehicles += 1;
+        }
+        if (action.deckIndex !== undefined) this.clearDeck(action.deckIndex);
+        break;
+      case "UnloadOutbound":
+      case "EnterInboundPreparationPosition":
+        break;
+    }
+  }
+
+  private elevatorPosition(location?: string): number {
+    const value = Number(location?.slice("elevator-position-".length));
+    return Number.isFinite(value) ? value : this.elevatorFloor;
+  }
+
+  private updatePreparationPositions(time: SimTime): void {
     for (const position of this.preparationPositions) {
-      if (position.direction === "outbound" && position.occupiedBy && (position.readyAt ?? 0) <= time) {
+      if (
+        position.direction === "outbound" &&
+        position.doorState === "open" &&
+        position.occupiedBy &&
+        (position.readyAt ?? Number.POSITIVE_INFINITY) <= time
+      ) {
         delete position.occupiedBy;
         delete position.readyAt;
+        position.doorState = "closing";
+        position.doorTransitionCompleteAt =
+          time + this.config.preparationPositions.doorSeconds;
+      }
+      if (
+        position.doorTransitionCompleteAt !== undefined &&
+        position.doorTransitionCompleteAt <= time
+      ) {
+        position.doorState =
+          position.doorState === "closing" ? "closed" : "open";
+        delete position.doorTransitionCompleteAt;
       }
     }
   }
 
-  private shouldBalk(queueLengthExcludingPps: number, context: GarageEventIntakeContext): boolean {
-    const policy = context.rng ? context : undefined;
-    if (!policy) return false;
-    const balking = {
-      startsAtQueueLength: 13,
-      initialProbability: 0.5,
-      probabilityStep: 0.1,
-      certainAtQueueLength: 18,
+  private fillInboundPreparationPositions(
+    time: SimTime,
+  ): GarageCompletedOperation[] {
+    const completed: GarageCompletedOperation[] = [];
+    const inboundPositions = this.preparationPositions.filter(
+      (position) => position.direction === "inbound",
+    );
+    for (const position of inboundPositions) {
+      if (this.inboundQueue.length === 0) return completed;
+      if (position.doorState !== "open" || position.occupiedBy) continue;
+      if (
+        this.config.preparationPositions.kind === "sequential" &&
+        inboundPositions.some(
+          (candidate) =>
+            Number(candidate.id.slice(3)) < Number(position.id.slice(3)) &&
+            !candidate.occupiedBy,
+        )
+      ) {
+        continue;
+      }
+      const next = this.inboundQueue.shift();
+      if (!next) return completed;
+      position.occupiedBy = next.vehicleId;
+      position.readyAt = time + this.preparationClearSeconds();
+      completed.push({
+        type: "EnterInboundPreparationPosition",
+        vehicleId: next.vehicleId,
+        durationSeconds: 0,
+        detail: {
+          preparationPositionId: position.id,
+          queuedAt: next.queuedAt,
+        },
+      });
+    }
+    return completed;
+  }
+
+  private startVmrTask(index: number, operation: GarageOperation): void {
+    const vmr = this.vmrs[index];
+    if (!vmr) return;
+    vmr.status = "Busy";
+    vmr.currentTask = {
+      type: operation.type,
+      startedAt: operation.startedAt,
+      completesAt: operation.completesAt,
+      ...(operation.from ? { from: operation.from } : {}),
+      ...(operation.to ? { to: operation.to } : {}),
+      ...(operation.vehicleId ? { vehicleId: operation.vehicleId } : {}),
+      ...(operation.path ? { path: operation.path } : {}),
     };
-    const queuePosition = queueLengthExcludingPps + 1;
-    if (queuePosition < balking.startsAtQueueLength) return false;
-    if (queuePosition >= balking.certainAtQueueLength) return true;
-    const probability =
-      balking.initialProbability +
-      (queuePosition - balking.startsAtQueueLength) * balking.probabilityStep;
-    return context.rng.nextFloat() < probability;
   }
 
-  private preparationClearSeconds(): number {
-    return this.config.preparationPositions.kind === "sequential"
-      ? this.config.preparationPositions.sequentialClearSeconds
-      : this.config.preparationPositions.parallelClearSeconds;
+  private finishVmrTask(index: number): void {
+    const vmr = this.vmrs[index];
+    if (!vmr) return;
+    const task = vmr.currentTask;
+    if (task) {
+      const distance = task.path?.distanceMeters ?? this.taskDistance(task.from, task.to);
+      vmr.distanceMovedMeters += distance;
+      this.counters.vmrDistanceMeters += distance;
+    }
+    vmr.status = "Idle";
+    delete vmr.currentTask;
   }
 
-  private estimateParkingSeconds(cellId: string): number {
-    const floor = this.layout.getCellFloor(cellId);
-    const verticalMeters = Math.max(0, floor - 1) * this.config.elevator.floorHeightMeters;
-    const verticalSeconds = verticalMeters / this.config.elevator.verticalSpeedMetersPerSecond;
-    const accessSeconds = this.layout.estimateAccessCost(cellId, this.getOccupancy());
-    return Math.ceil(verticalSeconds * 2 + accessSeconds + this.config.vmr.gripReleaseSeconds * 2);
+  private allVmrsHomeAndIdle(): boolean {
+    return this.vmrs.every(
+      (vmr) => vmr.status === "Idle" && vmr.deckId === vmr.homeDeckId,
+    );
   }
 
-  private estimateRetrievalSeconds(cellId: string): number {
-    return this.estimateParkingSeconds(cellId);
+  private validateActionGroupPaths(group: ElevatorTripActionGroup): void {
+    const pathActions = group.actions.filter(
+      (action): action is ElevatorTripAction & { path: VmrPath } =>
+        Boolean(action.path),
+    );
+    for (let index = 0; index < pathActions.length; index += 1) {
+      for (let otherIndex = index + 1; otherIndex < pathActions.length; otherIndex += 1) {
+        const first = pathActions[index];
+        const second = pathActions[otherIndex];
+        if (
+          first &&
+          second &&
+          this.pathPlanner.pathsConflict(first.path, second.path)
+        ) {
+          throw new Error(
+            `Concurrent VMR paths conflict in group '${group.name}': ` +
+              `${first.vehicleId ?? first.type} and ${second.vehicleId ?? second.type}.`,
+          );
+        }
+      }
+    }
+
+    const occupancy = this.getOccupancy();
+    for (const action of pathActions) {
+      const extraction =
+        action.type === "MoveBlocker" || action.type === "LoadOutbound";
+      const endpoint = extraction ? action.from : action.to;
+      if (!endpoint?.startsWith("f")) continue;
+      if (
+        !this.pathPlanner.isClear(
+          action.path,
+          occupancy,
+          endpoint,
+          extraction,
+        )
+      ) {
+        throw new Error(
+          `VMR path is obstructed for ${action.type} ${action.vehicleId ?? ""}: ` +
+            action.path.locations.join(" -> "),
+        );
+      }
+    }
   }
 
-  private getOccupancy() {
+  private clearDeck(index: number): void {
+    const deck = this.decks[index];
+    if (!deck) return;
+    delete deck.vehicleId;
+    delete deck.vehicleRole;
+  }
+
+  private findPp(id: string): PreparationPositionState | undefined {
+    return this.preparationPositions.find((position) => position.id === id);
+  }
+
+  private taskDistance(from?: string, to?: string): number {
+    const cell = [from, to].find((value) => value?.startsWith("f"));
+    if (cell) {
+      const geometry = this.layout.getCellGeometry(cell);
+      const centerRow = Math.ceil(this.config.layout.rows / 2);
+      const centerColumn = Math.ceil(this.config.layout.columns / 2);
+      return (
+        (Math.abs(geometry.row - centerRow) +
+          Math.abs(geometry.column - centerColumn)) *
+        3 *
+        2
+      );
+    }
+    const pp = [from, to].find((value) => value?.includes("PP"));
+    if (pp) {
+      const positionNumber = Number(/\d+$/.exec(pp)?.[0] ?? 1);
+      return Math.max(3, positionNumber * 3) * 2;
+    }
+    return 0;
+  }
+
+  private getOccupancy(): OccupancyState {
     const occupied: CellOccupancy[] = [...this.parked.values()].map((record) => ({
       cellId: record.cellId,
       vehicleId: record.vehicleId,
@@ -439,22 +749,74 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
       occupied,
       occupiedCount: occupied.length,
       totalParkingCells,
-      occupancyPercent: totalParkingCells === 0 ? 0 : occupied.length / totalParkingCells,
+      occupancyPercent:
+        totalParkingCells === 0 ? 0 : occupied.length / totalParkingCells,
     };
   }
 
-  private occupiedInboundPreparationPositions(): PreparationPositionState[] {
-    return this.preparationPositions.filter((position) => position.direction === "inbound" && position.occupiedBy);
+  private inboundVehiclesInPhysicalSystem(): number {
+    const onPps = this.preparationPositions.filter(
+      (position) => position.direction === "inbound" && position.occupiedBy,
+    ).length;
+    const onDecks = this.decks.filter(
+      (deck) => deck.vehicleRole === "inbound" && deck.vehicleId,
+    ).length;
+    return onPps + onDecks;
   }
 
   private updateMaxQueues(): void {
-    this.counters.maxInboundQueueLength = Math.max(this.counters.maxInboundQueueLength, this.inboundQueue.length);
-    this.counters.maxOutboundQueueLength = Math.max(this.counters.maxOutboundQueueLength, this.outboundQueue.length);
+    this.counters.maxInboundQueueLength = Math.max(
+      this.counters.maxInboundQueueLength,
+      this.inboundQueue.length,
+    );
+    this.counters.maxOutboundQueueLength = Math.max(
+      this.counters.maxOutboundQueueLength,
+      this.outboundQueue.length,
+    );
   }
 
-  private estimateOperationFloor(operation: GarageOperation): number {
-    const cell = operation.type === "ParkInbound" ? operation.to : operation.from;
-    if (!cell || !cell.startsWith("f")) return 1;
-    return this.layout.getCellFloor(cell);
+  private shouldBalk(
+    queueLengthExcludingPps: number,
+    context: GarageEventIntakeContext,
+  ): boolean {
+    const policy = {
+      startsAtQueueLength: 13,
+      initialProbability: 0.5,
+      probabilityStep: 0.1,
+      certainAtQueueLength: 18,
+    };
+    const queuePosition = queueLengthExcludingPps + 1;
+    if (queuePosition < policy.startsAtQueueLength) return false;
+    if (queuePosition >= policy.certainAtQueueLength) return true;
+    const probability =
+      policy.initialProbability +
+      (queuePosition - policy.startsAtQueueLength) * policy.probabilityStep;
+    return context.rng.nextFloat() < probability;
+  }
+
+  private preparationClearSeconds(): number {
+    return this.config.preparationPositions.kind === "sequential"
+      ? this.config.preparationPositions.sequentialClearSeconds
+      : this.config.preparationPositions.parallelClearSeconds;
+  }
+
+  private newCounters(): GarageCumulativeCounters {
+    return {
+      inboundAccepted: 0,
+      outboundAccepted: 0,
+      inboundBalked: 0,
+      inboundCompleted: 0,
+      outboundCompleted: 0,
+      rejectedEvents: 0,
+      maxInboundQueueLength: 0,
+      maxOutboundQueueLength: 0,
+      elevatorFloorsPassed: 0,
+      vmrDistanceMeters: 0,
+      inducedInboundTrips: 0,
+      inducedInboundVehicles: 0,
+      idleUnblockingActions: 0,
+      idleUnblockedVehicles: 0,
+      downwardTripPlacements: 0,
+    };
   }
 }

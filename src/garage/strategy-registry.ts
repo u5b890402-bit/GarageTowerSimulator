@@ -13,11 +13,12 @@ import type {
 import {
   FirstAvailablePlacementStrategy,
   FixedPreparationPositionPolicy,
+  IdleAfterTenMinutesUnblockingStrategy,
   LowestCostPlacementStrategy,
-  NoopElevatorTripPlanner,
   NoopUnblockingStrategy,
   SimpleRetrievalStrategy,
 } from "./strategies.js";
+import { BaselineElevatorTripPlanner } from "./elevator-trip-planner.js";
 
 type StrategyFactory<T> = (options: Record<string, unknown>) => T;
 
@@ -29,9 +30,9 @@ interface StrategyRegistry<T> {
 export const defaultGarageStrategyConfig: GarageStrategyConfig = {
   placement: { type: "lowest-access-cost" },
   retrieval: { type: "simple-retrieval" },
-  tripPlanner: { type: "single-operation" },
+  tripPlanner: { type: "baseline-physical" },
   preparationPositions: { type: "fixed-assignment" },
-  unblocking: { type: "disabled" },
+  unblocking: { type: "idle-after-10-minutes" },
 };
 
 const placementRegistry: StrategyRegistry<PlacementStrategy> = {
@@ -80,17 +81,21 @@ const retrievalRegistry: StrategyRegistry<RetrievalStrategy> = {
 
 const tripPlannerRegistry: StrategyRegistry<ElevatorTripPlanner> = {
   factories: {
+    "baseline-physical": (options) => {
+      requireNoOptions("baseline-physical", options);
+      return new BaselineElevatorTripPlanner();
+    },
     "single-operation": (options) => {
       requireNoOptions("single-operation", options);
-      return new NoopElevatorTripPlanner();
+      return new BaselineElevatorTripPlanner();
     },
   },
   descriptors: [
     {
       category: "tripPlanner",
-      type: "single-operation",
-      label: "Single Operation",
-      description: "Uses the baseline garage's one-operation-at-a-time scheduling behavior.",
+      type: "baseline-physical",
+      label: "Baseline Physical Planner",
+      description: "Builds elevator trips with deck assignments, blocker moves, explicit VMR paths, and PP transfers.",
     },
   ],
 };
@@ -114,12 +119,22 @@ const preparationPositionRegistry: StrategyRegistry<PreparationPositionPolicy> =
 
 const unblockingRegistry: StrategyRegistry<UnblockingStrategy> = {
   factories: {
+    "idle-after-10-minutes": (options) => {
+      requireNoOptions("idle-after-10-minutes", options);
+      return new IdleAfterTenMinutesUnblockingStrategy();
+    },
     disabled: (options) => {
       requireNoOptions("disabled", options);
       return new NoopUnblockingStrategy();
     },
   },
   descriptors: [
+    {
+      category: "unblocking",
+      type: "idle-after-10-minutes",
+      label: "Idle After 10 Minutes",
+      description: "Relocates blocking vehicles after ten minutes without normal demand.",
+    },
     {
       category: "unblocking",
       type: "disabled",

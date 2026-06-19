@@ -8,7 +8,19 @@ export type SimulationEventType = "InboundArrival" | "OutboundRequest";
 export type PreparationPositionKind = "parallel" | "sequential";
 export type PreparationPositionMode = "designated" | "dynamic";
 export type BlockageType = "none" | "shallow" | "deep";
-export type GarageOperationType = "ParkInbound" | "RetrieveOutbound" | "IdleUnblock";
+export type GarageOperationType =
+  | "EnterInboundPreparationPosition"
+  | "ParkInbound"
+  | "RetrieveOutbound"
+  | "LoadInbound"
+  | "LoadOutbound"
+  | "UnloadOutbound"
+  | "MoveElevator"
+  | "RotateDeck"
+  | "MoveBlocker"
+  | "RelocateBlocker"
+  | "OperateDoor"
+  | "IdleUnblock";
 
 export interface RandomSource {
   nextFloat(): number;
@@ -272,12 +284,17 @@ export interface ElevatorState {
   status: "IdleAtHome" | "Busy";
   currentFloor: number;
   deckCount: number;
+  direction?: "up" | "down" | "stopped";
+  decks?: ElevatorDeckState[];
+  activeTrip?: ElevatorTripState;
   activeOperationId?: string;
 }
 
 export interface PreparationPositionState {
   id: string;
   direction: "inbound" | "outbound";
+  doorState?: "open" | "closed" | "opening" | "closing";
+  doorTransitionCompleteAt?: SimTime;
   occupiedBy?: VehicleId;
   readyAt?: SimTime;
 }
@@ -286,7 +303,46 @@ export interface VmrState {
   id: string;
   deckId: string;
   status: "Idle" | "Busy";
+  homeDeckId?: string;
+  currentTask?: VmrTaskState;
   distanceMovedMeters: number;
+}
+
+export interface ElevatorDeckState {
+  id: string;
+  index: number;
+  alignedFloor: number;
+  orientation: "garage" | "street";
+  vehicleId?: VehicleId;
+  vehicleRole?: "inbound" | "outbound" | "blocker";
+  vmrId: string;
+}
+
+export interface VmrTaskState {
+  type: GarageOperationType;
+  startedAt: SimTime;
+  completesAt: SimTime;
+  from?: LocationId;
+  to?: LocationId;
+  vehicleId?: VehicleId;
+  path?: VmrPath;
+}
+
+export interface VmrPath {
+  floor: number;
+  locations: LocationId[];
+  cells: CellId[];
+  distanceMeters: number;
+}
+
+export interface ElevatorTripState {
+  id: string;
+  phase: string;
+  startedAt: SimTime;
+  route: number[];
+  routeIndex: number;
+  inboundVehicleIds: VehicleId[];
+  outboundVehicleIds: VehicleId[];
 }
 
 export interface GarageOperation {
@@ -297,6 +353,7 @@ export interface GarageOperation {
   completesAt: SimTime;
   from?: LocationId;
   to?: LocationId;
+  path?: VmrPath;
 }
 
 export interface GarageCumulativeCounters {
@@ -327,6 +384,8 @@ export interface GarageLayout {
   getParkingCells(): CellId[];
   getCellFloor(cellId: CellId): number;
   getCellGeometry(cellId: CellId): CellGeometry;
+  getBlockingCells(cellId: CellId, occupancy: OccupancyState): CellId[];
+  wouldCreateBlockedEmptyCell(cellId: CellId, occupancy: OccupancyState): boolean;
   classifyBlockage(cellId: CellId, occupancy: OccupancyState): BlockageType;
   estimateAccessCost(cellId: CellId, occupancy: OccupancyState): DurationSeconds;
 }
@@ -377,15 +436,61 @@ export interface RetrievalStrategy {
   buildRetrievalPlan(vehicleId: VehicleId, context: RetrievalContext): RetrievalPlan;
 }
 
+export interface VmrPathPlanner {
+  findAccessPlan(
+    cellId: CellId,
+    occupancy: OccupancyState,
+  ): { path: VmrPath; blockerCells: CellId[] } | null;
+  findClearPathFromElevator(cellId: CellId, occupancy: OccupancyState): VmrPath | null;
+  findClearPathToElevator(cellId: CellId, occupancy: OccupancyState): VmrPath | null;
+  isClear(
+    path: VmrPath,
+    occupancy: OccupancyState,
+    endpointCell: CellId,
+    endpointMayBeOccupied: boolean,
+  ): boolean;
+  pathsConflict(a: VmrPath, b: VmrPath): boolean;
+}
+
 export interface TripPlanningContext {
   time: SimTime;
   snapshot: GarageStateSnapshot;
+  config: GarageConfig;
+  layout: GarageLayout;
+  pathPlanner: VmrPathPlanner;
+  placementStrategy: PlacementStrategy;
+  idleSeconds: number;
+  idleUnblockingAllowed: boolean;
 }
 
 export interface ElevatorTripPlan {
   id: string;
+  phase: "planned" | "idle-unblocking";
   stops: number[];
-  operations: GarageOperation[];
+  inboundVehicleIds: VehicleId[];
+  outboundVehicleIds: VehicleId[];
+  selectedOutboundVehicleIds: VehicleId[];
+  inducedInboundVehicles: number;
+  groups: ElevatorTripActionGroup[];
+}
+
+export interface ElevatorTripActionGroup {
+  name: string;
+  actions: ElevatorTripAction[];
+  elevatorDirection?: "up" | "down" | "stopped";
+}
+
+export interface ElevatorTripAction {
+  type: GarageOperationType;
+  durationSeconds: number;
+  vehicleId?: VehicleId;
+  from?: LocationId;
+  to?: LocationId;
+  path?: VmrPath;
+  deckIndex?: number;
+  preparationPositionId?: string;
+  doorFinalState?: "open" | "closed";
+  setDriverReady?: boolean;
 }
 
 export interface ElevatorTripPlanner {
@@ -438,8 +543,9 @@ export interface SimulationRunner {
 }
 
 export interface DemandGenerator {
-  initialize(params: DemandGenerationConfig, seed: number): void;
+  initialize(params: DemandGenerationConfig, runtime: SimulationRuntimeConfig, seed: number): void;
   generateEventsAt(time: SimTime, garageState: GarageStateSnapshot): SimulationEvent[];
+  recordIntakeResults(results: EventAcceptanceResult[]): void;
 }
 
 export interface SimulationStateRecorder {
@@ -502,10 +608,13 @@ export interface DailyReportMetrics {
   dayOfWeek: string;
   successfulActivities: number;
   vehiclesStayingUntilMidnight: number;
+  averageInboundDriverWaitingSeconds: number;
   averageInboundWaitSeconds: number;
   averageOutboundWaitSeconds: number;
+  averageInboundDriverWaitingSecondsDuringMorningPeak: number;
   averageInboundWaitSecondsDuringMorningPeak: number;
   averageOutboundWaitSecondsDuringEveningPeak: number;
+  longestInboundDriverWaitingSeconds: number;
   longestInboundWaitSeconds: number;
   longestOutboundWaitSeconds: number;
   biggestInboundQueueLength: number;

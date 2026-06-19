@@ -80,9 +80,9 @@ const exampleConfig: SimulationConfig = {
     strategies: {
       placement: { type: "lowest-access-cost" },
       retrieval: { type: "simple-retrieval" },
-      tripPlanner: { type: "single-operation" },
+      tripPlanner: { type: "baseline-physical" },
       preparationPositions: { type: "fixed-assignment" },
-      unblocking: { type: "disabled" },
+      unblocking: { type: "idle-after-10-minutes" },
     },
   },
 };
@@ -256,7 +256,10 @@ function renderSummary(run: BrowserRunResult): void {
   const finalSnapshot = run.result.finalSnapshot;
   setText("metric-activities", String(summary.successfulActivities));
   setText("metric-occupancy", `${finalSnapshot.occupancy.occupiedCount}/${finalSnapshot.occupancy.totalParkingCells}`);
-  setText("metric-inbound-wait", `${Math.round(summary.averageInboundWaitSeconds)}s`);
+  setText(
+    "metric-inbound-wait",
+    `${Math.round(summary.averageInboundDriverWaitingSeconds)}s`,
+  );
   setText("metric-outbound-wait", `${Math.round(summary.averageOutboundWaitSeconds)}s`);
   setText("metric-revenue", String(summary.totalRevenue));
   setText("metric-raw-size", `${Math.round(run.rawJsonl.length / 1024)} KB`);

@@ -5,13 +5,14 @@ define("domain/types", ["require", "exports"], function (require, exports) {
 define("garage/strategies", ["require", "exports"], function (require, exports) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
-    exports.NoopUnblockingStrategy = exports.FixedPreparationPositionPolicy = exports.NoopElevatorTripPlanner = exports.SimpleRetrievalStrategy = exports.FirstAvailablePlacementStrategy = exports.LowestCostPlacementStrategy = void 0;
+    exports.IdleAfterTenMinutesUnblockingStrategy = exports.NoopUnblockingStrategy = exports.FixedPreparationPositionPolicy = exports.SimpleRetrievalStrategy = exports.FirstAvailablePlacementStrategy = exports.LowestCostPlacementStrategy = void 0;
     class LowestCostPlacementStrategy {
         rankCandidateCells(context) {
             const occupied = new Set(context.occupancy.occupied.map((cell) => cell.cellId));
             return context.layout
                 .getParkingCells()
                 .filter((cellId) => !occupied.has(cellId))
+                .filter((cellId) => !context.layout.wouldCreateBlockedEmptyCell(cellId, context.occupancy))
                 .map((cellId) => ({
                 cellId,
                 score: context.layout.estimateAccessCost(cellId, context.occupancy),
@@ -30,6 +31,7 @@ define("garage/strategies", ["require", "exports"], function (require, exports) 
             return context.layout
                 .getParkingCells()
                 .filter((cellId) => !occupied.has(cellId))
+                .filter((cellId) => !context.layout.wouldCreateBlockedEmptyCell(cellId, context.occupancy))
                 .map((cellId, index) => ({
                 cellId,
                 score: index,
@@ -63,12 +65,6 @@ define("garage/strategies", ["require", "exports"], function (require, exports) 
         }
     }
     exports.SimpleRetrievalStrategy = SimpleRetrievalStrategy;
-    class NoopElevatorTripPlanner {
-        planNextTrip() {
-            return null;
-        }
-    }
-    exports.NoopElevatorTripPlanner = NoopElevatorTripPlanner;
     class FixedPreparationPositionPolicy {
         chooseAssignments(context) {
             const inboundPositionIds = context.snapshot.preparationPositions
@@ -90,8 +86,474 @@ define("garage/strategies", ["require", "exports"], function (require, exports) 
         }
     }
     exports.NoopUnblockingStrategy = NoopUnblockingStrategy;
+    class IdleAfterTenMinutesUnblockingStrategy {
+        shouldStartIdleUnblocking(context) {
+            return context.idleSeconds >= 600;
+        }
+        planUnblocking(_context) {
+            return { operations: [] };
+        }
+    }
+    exports.IdleAfterTenMinutesUnblockingStrategy = IdleAfterTenMinutesUnblockingStrategy;
 });
-define("garage/strategy-registry", ["require", "exports", "garage/strategies"], function (require, exports, strategies_js_1) {
+define("garage/elevator-trip-planner", ["require", "exports"], function (require, exports) {
+    "use strict";
+    Object.defineProperty(exports, "__esModule", { value: true });
+    exports.BaselineElevatorTripPlanner = void 0;
+    class BaselineElevatorTripPlanner {
+        constructor() {
+            this.nextTripNumber = 1;
+        }
+        planNextTrip(context) {
+            const readyInboundPositions = context.snapshot.preparationPositions.filter((position) => position.direction === "inbound" &&
+                position.occupiedBy &&
+                position.doorState === "open" &&
+                (position.readyAt ?? Number.POSITIVE_INFINITY) <= context.time);
+            const outboundPps = context.snapshot.preparationPositions.filter((position) => position.direction === "outbound" &&
+                !position.occupiedBy &&
+                position.doorState === "closed");
+            let planningOccupancy = this.cloneOccupancy(context.snapshot.occupancy);
+            const outboundAssignments = [];
+            let maxBlockerDecks = 0;
+            for (const queued of context.snapshot.queues.outbound) {
+                if (outboundAssignments.length >= outboundPps.length)
+                    break;
+                const parked = planningOccupancy.occupied.find((cell) => cell.vehicleId === queued.vehicleId);
+                if (!parked)
+                    continue;
+                const accessPlan = context.pathPlanner.findAccessPlan(parked.cellId, planningOccupancy);
+                if (!accessPlan)
+                    continue;
+                const blockers = accessPlan.blockerCells
+                    .map((cellId) => planningOccupancy.occupied.find((cell) => cell.cellId === cellId))
+                    .filter((cell) => Boolean(cell));
+                const targetCount = outboundAssignments.length + 1;
+                if (targetCount + Math.max(maxBlockerDecks, blockers.length) >
+                    context.snapshot.elevator.deckCount) {
+                    continue;
+                }
+                const usedTargetDecks = new Set(outboundAssignments.map((assignment) => assignment.deckIndex));
+                const targetDeckIndex = this.firstFreeDeckIndex(usedTargetDecks, context.snapshot.elevator.deckCount);
+                if (targetDeckIndex === null)
+                    continue;
+                const reserved = new Set([...usedTargetDecks, targetDeckIndex]);
+                const provisionalBlockers = [];
+                for (const blocker of blockers) {
+                    const deckIndex = this.firstFreeDeckIndex(reserved, context.snapshot.elevator.deckCount);
+                    if (deckIndex === null)
+                        break;
+                    reserved.add(deckIndex);
+                    provisionalBlockers.push({
+                        vehicleId: blocker.vehicleId,
+                        cellId: blocker.cellId,
+                        deckIndex,
+                    });
+                }
+                if (provisionalBlockers.length !== blockers.length)
+                    continue;
+                const physicalPlan = this.planOutboundPhysicalPaths(parked.cellId, provisionalBlockers, planningOccupancy, context);
+                if (!physicalPlan)
+                    continue;
+                outboundAssignments.push({
+                    vehicleId: queued.vehicleId,
+                    cellId: parked.cellId,
+                    deckIndex: targetDeckIndex,
+                    outboundPpId: outboundPps[outboundAssignments.length]?.id ?? "",
+                    blockers: physicalPlan.blockers,
+                    extractionPath: physicalPlan.extractionPath,
+                });
+                planningOccupancy = physicalPlan.occupancy;
+                maxBlockerDecks = Math.max(maxBlockerDecks, physicalPlan.blockers.length);
+            }
+            const reservedForOutbound = outboundAssignments.length + maxBlockerDecks;
+            const availableInboundDecks = Math.max(0, context.snapshot.elevator.deckCount - reservedForOutbound);
+            const inboundAssignments = this.assignInboundDestinations(readyInboundPositions.slice(0, availableInboundDecks), outboundAssignments, planningOccupancy, context);
+            if (outboundAssignments.length === 0 && inboundAssignments.length === 0) {
+                return this.planIdleUnblockingTrip(context);
+            }
+            const tripId = `trip-${this.nextTripNumber++}`;
+            const groups = this.buildTripGroups(inboundAssignments, outboundAssignments, context);
+            return {
+                id: tripId,
+                phase: "planned",
+                stops: this.extractStops(groups),
+                inboundVehicleIds: inboundAssignments.map((assignment) => assignment.vehicleId),
+                outboundVehicleIds: outboundAssignments.map((assignment) => assignment.vehicleId),
+                selectedOutboundVehicleIds: outboundAssignments.map((assignment) => assignment.vehicleId),
+                inducedInboundVehicles: outboundAssignments.reduce((count, assignment) => count + assignment.blockers.length, 0),
+                groups,
+            };
+        }
+        assignInboundDestinations(positions, outbound, plannedOccupancy, context) {
+            const simulated = this.cloneOccupancy(plannedOccupancy);
+            const reservedDecks = new Set(outbound.flatMap((assignment) => [
+                assignment.deckIndex,
+                ...assignment.blockers.map((blocker) => blocker.deckIndex),
+            ]));
+            const assignments = [];
+            for (const position of positions) {
+                if (!position.occupiedBy)
+                    continue;
+                const deckIndex = this.firstFreeDeckIndex(reservedDecks, context.snapshot.elevator.deckCount);
+                if (deckIndex === null)
+                    break;
+                const destination = this.chooseAccessibleDestination(position.occupiedBy, simulated, context);
+                if (!destination)
+                    continue;
+                const path = context.pathPlanner.findClearPathFromElevator(destination, simulated);
+                if (!path)
+                    continue;
+                reservedDecks.add(deckIndex);
+                assignments.push({
+                    vehicleId: position.occupiedBy,
+                    ppId: position.id,
+                    deckIndex,
+                    destination,
+                    path,
+                });
+                this.addOccupancy(simulated, destination, position.occupiedBy, context.time);
+            }
+            return assignments;
+        }
+        planOutboundPhysicalPaths(outboundCell, blockers, occupancy, context) {
+            const simulated = this.cloneOccupancy(occupancy);
+            const extractions = [];
+            for (const blocker of blockers) {
+                const extractionPath = context.pathPlanner.findClearPathToElevator(blocker.cellId, simulated);
+                if (!extractionPath)
+                    return null;
+                extractions.push({ ...blocker, extractionPath });
+                this.removeVehicleFromOccupancy(simulated, blocker.vehicleId);
+            }
+            const extractionPath = context.pathPlanner.findClearPathToElevator(outboundCell, simulated);
+            if (!extractionPath)
+                return null;
+            const outboundVehicle = simulated.occupied.find((cell) => cell.cellId === outboundCell);
+            if (!outboundVehicle)
+                return null;
+            this.removeVehicleFromOccupancy(simulated, outboundVehicle.vehicleId);
+            const assignments = [];
+            for (const blocker of extractions) {
+                const destinationCell = this.chooseAccessibleDestination(blocker.vehicleId, simulated, context);
+                if (!destinationCell)
+                    return null;
+                const relocationPath = context.pathPlanner.findClearPathFromElevator(destinationCell, simulated);
+                if (!relocationPath)
+                    return null;
+                assignments.push({ ...blocker, destinationCell, relocationPath });
+                this.addOccupancy(simulated, destinationCell, blocker.vehicleId, context.time);
+            }
+            return { blockers: assignments, extractionPath, occupancy: simulated };
+        }
+        buildTripGroups(inbound, outbound, context) {
+            const groups = [];
+            let plannedElevatorPosition = context.snapshot.elevator.currentFloor;
+            const inboundPps = inbound
+                .map((assignment) => context.snapshot.preparationPositions.find((position) => position.id === assignment.ppId))
+                .filter((position) => Boolean(position));
+            if (inboundPps.length > 0) {
+                groups.push(this.doorGroup("close-inbound-doors", inboundPps, "closed", context));
+                groups.push(this.rotateDeckGroup("rotate-inbound-to-street", inbound.map((assignment) => assignment.deckIndex), "street", context));
+                groups.push({
+                    name: "load-inbound",
+                    actions: inbound.map((assignment) => ({
+                        type: "LoadInbound",
+                        vehicleId: assignment.vehicleId,
+                        from: assignment.ppId,
+                        to: this.deckId(assignment.deckIndex),
+                        deckIndex: assignment.deckIndex,
+                        preparationPositionId: assignment.ppId,
+                        durationSeconds: this.ppTransferSeconds(assignment.ppId, context),
+                    })),
+                });
+                groups.push(this.rotateDeckGroup("rotate-inbound-to-garage", inbound.map((assignment) => assignment.deckIndex), "garage", context));
+                groups.push(this.doorGroup("open-inbound-doors", inboundPps, "open", context));
+            }
+            for (const assignment of outbound) {
+                for (const blocker of assignment.blockers) {
+                    const position = this.alignmentPosition(context.layout.getCellFloor(blocker.cellId), blocker.deckIndex);
+                    groups.push(this.moveElevatorGroup(position, plannedElevatorPosition, context));
+                    plannedElevatorPosition = position;
+                    groups.push({
+                        name: `buffer-blocker-${blocker.vehicleId}`,
+                        actions: [
+                            {
+                                type: "MoveBlocker",
+                                vehicleId: blocker.vehicleId,
+                                from: blocker.cellId,
+                                to: this.deckId(blocker.deckIndex),
+                                path: blocker.extractionPath,
+                                deckIndex: blocker.deckIndex,
+                                durationSeconds: this.pathTransferSeconds(blocker.extractionPath, context),
+                            },
+                        ],
+                    });
+                }
+                const targetPosition = this.alignmentPosition(context.layout.getCellFloor(assignment.cellId), assignment.deckIndex);
+                groups.push(this.moveElevatorGroup(targetPosition, plannedElevatorPosition, context));
+                plannedElevatorPosition = targetPosition;
+                groups.push({
+                    name: `load-outbound-${assignment.vehicleId}`,
+                    actions: [
+                        {
+                            type: "LoadOutbound",
+                            vehicleId: assignment.vehicleId,
+                            from: assignment.cellId,
+                            to: this.deckId(assignment.deckIndex),
+                            path: assignment.extractionPath,
+                            deckIndex: assignment.deckIndex,
+                            durationSeconds: this.pathTransferSeconds(assignment.extractionPath, context),
+                        },
+                    ],
+                });
+                for (const blocker of assignment.blockers) {
+                    const position = this.alignmentPosition(context.layout.getCellFloor(blocker.destinationCell), blocker.deckIndex);
+                    groups.push(this.moveElevatorGroup(position, plannedElevatorPosition, context));
+                    plannedElevatorPosition = position;
+                    groups.push({
+                        name: `relocate-blocker-${blocker.vehicleId}`,
+                        actions: [
+                            {
+                                type: "RelocateBlocker",
+                                vehicleId: blocker.vehicleId,
+                                from: this.deckId(blocker.deckIndex),
+                                to: blocker.destinationCell,
+                                path: blocker.relocationPath,
+                                deckIndex: blocker.deckIndex,
+                                durationSeconds: this.pathTransferSeconds(blocker.relocationPath, context),
+                            },
+                        ],
+                    });
+                }
+            }
+            for (const assignment of inbound) {
+                const position = this.alignmentPosition(context.layout.getCellFloor(assignment.destination), assignment.deckIndex);
+                groups.push(this.moveElevatorGroup(position, plannedElevatorPosition, context));
+                plannedElevatorPosition = position;
+                groups.push({
+                    name: `park-inbound-${assignment.vehicleId}`,
+                    elevatorDirection: "down",
+                    actions: [
+                        {
+                            type: "ParkInbound",
+                            vehicleId: assignment.vehicleId,
+                            from: this.deckId(assignment.deckIndex),
+                            to: assignment.destination,
+                            path: assignment.path,
+                            deckIndex: assignment.deckIndex,
+                            durationSeconds: this.pathTransferSeconds(assignment.path, context),
+                        },
+                    ],
+                });
+            }
+            groups.push(this.moveElevatorGroup(1, plannedElevatorPosition, context));
+            if (outbound.length > 0) {
+                groups.push(this.rotateDeckGroup("rotate-outbound-to-street", outbound.map((assignment) => assignment.deckIndex), "street", context));
+                groups.push({
+                    name: "unload-outbound",
+                    actions: outbound.map((assignment) => ({
+                        type: "RetrieveOutbound",
+                        vehicleId: assignment.vehicleId,
+                        from: this.deckId(assignment.deckIndex),
+                        to: assignment.outboundPpId,
+                        deckIndex: assignment.deckIndex,
+                        preparationPositionId: assignment.outboundPpId,
+                        durationSeconds: this.ppTransferSeconds(assignment.outboundPpId, context),
+                    })),
+                });
+                const outboundPps = outbound
+                    .map((assignment) => context.snapshot.preparationPositions.find((position) => position.id === assignment.outboundPpId))
+                    .filter((position) => Boolean(position));
+                groups.push(this.doorGroup("open-outbound-doors", outboundPps, "open", context, true));
+                groups.push(this.rotateDeckGroup("rotate-outbound-to-garage", outbound.map((assignment) => assignment.deckIndex), "garage", context));
+            }
+            return groups.filter((group) => group.actions.length > 0);
+        }
+        planIdleUnblockingTrip(context) {
+            if (!context.idleUnblockingAllowed ||
+                context.snapshot.queues.inbound.length > 0 ||
+                context.snapshot.queues.outbound.length > 0 ||
+                context.snapshot.preparationPositions.some((position) => position.occupiedBy)) {
+                return null;
+            }
+            const occupancy = context.snapshot.occupancy;
+            for (const target of occupancy.occupied) {
+                const blockerCell = context.pathPlanner.findAccessPlan(target.cellId, occupancy)?.blockerCells[0];
+                if (!blockerCell)
+                    continue;
+                const blocker = occupancy.occupied.find((cell) => cell.cellId === blockerCell);
+                if (!blocker)
+                    continue;
+                const extractionPath = context.pathPlanner.findClearPathToElevator(blockerCell, occupancy);
+                if (!extractionPath)
+                    continue;
+                const simulated = this.cloneOccupancy(occupancy);
+                this.removeVehicleFromOccupancy(simulated, blocker.vehicleId);
+                const destination = this.chooseAccessibleDestination(blocker.vehicleId, simulated, context);
+                if (!destination || destination === blockerCell)
+                    continue;
+                const relocationPath = context.pathPlanner.findClearPathFromElevator(destination, simulated);
+                if (!relocationPath)
+                    continue;
+                const sourcePosition = this.alignmentPosition(context.layout.getCellFloor(blockerCell), 0);
+                const destinationPosition = this.alignmentPosition(context.layout.getCellFloor(destination), 0);
+                const groups = [
+                    this.moveElevatorGroup(sourcePosition, context.snapshot.elevator.currentFloor, context),
+                    {
+                        name: `buffer-idle-blocker-${blocker.vehicleId}`,
+                        actions: [
+                            {
+                                type: "MoveBlocker",
+                                vehicleId: blocker.vehicleId,
+                                from: blockerCell,
+                                to: this.deckId(0),
+                                path: extractionPath,
+                                deckIndex: 0,
+                                durationSeconds: this.pathTransferSeconds(extractionPath, context),
+                            },
+                        ],
+                    },
+                    this.moveElevatorGroup(destinationPosition, sourcePosition, context),
+                    {
+                        name: `relocate-idle-blocker-${blocker.vehicleId}`,
+                        actions: [
+                            {
+                                type: "IdleUnblock",
+                                vehicleId: blocker.vehicleId,
+                                from: this.deckId(0),
+                                to: destination,
+                                path: relocationPath,
+                                deckIndex: 0,
+                                durationSeconds: this.pathTransferSeconds(relocationPath, context),
+                            },
+                        ],
+                    },
+                    this.moveElevatorGroup(1, destinationPosition, context),
+                ];
+                return {
+                    id: `unblock-${this.nextTripNumber++}`,
+                    phase: "idle-unblocking",
+                    stops: [sourcePosition, destinationPosition, 1],
+                    inboundVehicleIds: [],
+                    outboundVehicleIds: [],
+                    selectedOutboundVehicleIds: [],
+                    inducedInboundVehicles: 0,
+                    groups,
+                };
+            }
+            return null;
+        }
+        moveElevatorGroup(targetPosition, from, context) {
+            const floorDistance = Math.abs(targetPosition - from);
+            const duration = Math.ceil((floorDistance * context.config.elevator.floorHeightMeters) /
+                context.config.elevator.verticalSpeedMetersPerSecond);
+            return {
+                name: `move-elevator-${targetPosition}`,
+                elevatorDirection: targetPosition > from ? "up" : targetPosition < from ? "down" : "stopped",
+                actions: [
+                    {
+                        type: "MoveElevator",
+                        from: `elevator-position-${from}`,
+                        to: `elevator-position-${targetPosition}`,
+                        durationSeconds: Math.max(1, duration),
+                    },
+                ],
+            };
+        }
+        rotateDeckGroup(name, deckIndexes, orientation, context) {
+            return {
+                name,
+                actions: [...new Set(deckIndexes)].map((deckIndex) => ({
+                    type: "RotateDeck",
+                    from: orientation === "garage" ? "street" : "garage",
+                    to: orientation,
+                    deckIndex,
+                    durationSeconds: context.config.elevator.deckRotationSeconds,
+                })),
+            };
+        }
+        doorGroup(name, positions, finalState, context, setDriverReady = false) {
+            return {
+                name,
+                actions: positions.map((position) => ({
+                    type: "OperateDoor",
+                    from: position.doorState ??
+                        (position.direction === "inbound" ? "open" : "closed"),
+                    to: finalState,
+                    preparationPositionId: position.id,
+                    doorFinalState: finalState,
+                    setDriverReady,
+                    durationSeconds: context.config.preparationPositions.doorSeconds,
+                })),
+            };
+        }
+        chooseAccessibleDestination(vehicleId, occupancy, context) {
+            const ranked = context.placementStrategy.rankCandidateCells({
+                time: context.time,
+                layout: context.layout,
+                occupancy,
+            });
+            for (const candidate of ranked) {
+                if (context.pathPlanner.findClearPathFromElevator(candidate.cellId, occupancy)) {
+                    return candidate.cellId;
+                }
+            }
+            return null;
+        }
+        ppTransferSeconds(ppId, context) {
+            const positionNumber = Number(/\d+$/.exec(ppId)?.[0] ?? 1);
+            const oneWayDistance = Math.max(3, positionNumber * 3);
+            return Math.ceil((oneWayDistance * 2) / context.config.vmr.speedMetersPerSecond +
+                context.config.vmr.gripReleaseSeconds * 2);
+        }
+        pathTransferSeconds(path, context) {
+            return Math.ceil(path.distanceMeters / context.config.vmr.speedMetersPerSecond +
+                context.config.vmr.gripReleaseSeconds * 2);
+        }
+        extractStops(groups) {
+            return groups
+                .filter((group) => group.name.startsWith("move-elevator-"))
+                .map((group) => Number(group.name.slice("move-elevator-".length)));
+        }
+        firstFreeDeckIndex(reserved, deckCount) {
+            for (let index = 0; index < deckCount; index += 1) {
+                if (!reserved.has(index))
+                    return index;
+            }
+            return null;
+        }
+        alignmentPosition(floor, deckIndex) {
+            return floor + deckIndex;
+        }
+        deckId(index) {
+            return `D${index + 1}`;
+        }
+        cloneOccupancy(occupancy) {
+            return {
+                ...occupancy,
+                occupied: occupancy.occupied.map((cell) => ({ ...cell })),
+            };
+        }
+        addOccupancy(occupancy, cellId, vehicleId, parkedAt) {
+            occupancy.occupied.push({ cellId, vehicleId, parkedAt });
+            occupancy.occupiedCount = occupancy.occupied.length;
+            occupancy.occupancyPercent =
+                occupancy.totalParkingCells === 0
+                    ? 0
+                    : occupancy.occupiedCount / occupancy.totalParkingCells;
+        }
+        removeVehicleFromOccupancy(occupancy, vehicleId) {
+            occupancy.occupied = occupancy.occupied.filter((cell) => cell.vehicleId !== vehicleId);
+            occupancy.occupiedCount = occupancy.occupied.length;
+            occupancy.occupancyPercent =
+                occupancy.totalParkingCells === 0
+                    ? 0
+                    : occupancy.occupiedCount / occupancy.totalParkingCells;
+        }
+    }
+    exports.BaselineElevatorTripPlanner = BaselineElevatorTripPlanner;
+});
+define("garage/strategy-registry", ["require", "exports", "garage/strategies", "garage/elevator-trip-planner"], function (require, exports, strategies_js_1, elevator_trip_planner_js_1) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
     exports.defaultGarageStrategyConfig = void 0;
@@ -102,9 +564,9 @@ define("garage/strategy-registry", ["require", "exports", "garage/strategies"], 
     exports.defaultGarageStrategyConfig = {
         placement: { type: "lowest-access-cost" },
         retrieval: { type: "simple-retrieval" },
-        tripPlanner: { type: "single-operation" },
+        tripPlanner: { type: "baseline-physical" },
         preparationPositions: { type: "fixed-assignment" },
-        unblocking: { type: "disabled" },
+        unblocking: { type: "idle-after-10-minutes" },
     };
     const placementRegistry = {
         factories: {
@@ -150,17 +612,21 @@ define("garage/strategy-registry", ["require", "exports", "garage/strategies"], 
     };
     const tripPlannerRegistry = {
         factories: {
+            "baseline-physical": (options) => {
+                requireNoOptions("baseline-physical", options);
+                return new elevator_trip_planner_js_1.BaselineElevatorTripPlanner();
+            },
             "single-operation": (options) => {
                 requireNoOptions("single-operation", options);
-                return new strategies_js_1.NoopElevatorTripPlanner();
+                return new elevator_trip_planner_js_1.BaselineElevatorTripPlanner();
             },
         },
         descriptors: [
             {
                 category: "tripPlanner",
-                type: "single-operation",
-                label: "Single Operation",
-                description: "Uses the baseline garage's one-operation-at-a-time scheduling behavior.",
+                type: "baseline-physical",
+                label: "Baseline Physical Planner",
+                description: "Builds elevator trips with deck assignments, blocker moves, explicit VMR paths, and PP transfers.",
             },
         ],
     };
@@ -182,12 +648,22 @@ define("garage/strategy-registry", ["require", "exports", "garage/strategies"], 
     };
     const unblockingRegistry = {
         factories: {
+            "idle-after-10-minutes": (options) => {
+                requireNoOptions("idle-after-10-minutes", options);
+                return new strategies_js_1.IdleAfterTenMinutesUnblockingStrategy();
+            },
             disabled: (options) => {
                 requireNoOptions("disabled", options);
                 return new strategies_js_1.NoopUnblockingStrategy();
             },
         },
         descriptors: [
+            {
+                category: "unblocking",
+                type: "idle-after-10-minutes",
+                label: "Idle After 10 Minutes",
+                description: "Relocates blocking vehicles after ten minutes without normal demand.",
+            },
             {
                 category: "unblocking",
                 type: "disabled",
@@ -371,10 +847,13 @@ define("report/metrics-aggregator", ["require", "exports"], function (require, e
                 dayOfWeek: day.dayOfWeek,
                 successfulActivities: day.successfulActivities,
                 vehiclesStayingUntilMidnight: day.vehiclesStayingUntilMidnight,
+                averageInboundDriverWaitingSeconds: average(day.inboundDriverWaitingSeconds),
                 averageInboundWaitSeconds: average(day.inboundWaitSeconds),
                 averageOutboundWaitSeconds: average(day.outboundWaitSeconds),
+                averageInboundDriverWaitingSecondsDuringMorningPeak: average(day.morningPeakInboundDriverWaitingSeconds),
                 averageInboundWaitSecondsDuringMorningPeak: average(day.morningPeakInboundWaitSeconds),
                 averageOutboundWaitSecondsDuringEveningPeak: average(day.eveningPeakOutboundWaitSeconds),
+                longestInboundDriverWaitingSeconds: max(day.inboundDriverWaitingSeconds),
                 longestInboundWaitSeconds: max(day.inboundWaitSeconds),
                 longestOutboundWaitSeconds: max(day.outboundWaitSeconds),
                 biggestInboundQueueLength: day.biggestInboundQueueLength,
@@ -415,6 +894,16 @@ define("report/metrics-aggregator", ["require", "exports"], function (require, e
             for (const operation of operations) {
                 if (!operation.vehicleId)
                     continue;
+                if (operation.type === "EnterInboundPreparationPosition") {
+                    const arrivalTime = this.inboundEventTimeByVehicle.get(operation.vehicleId);
+                    if (arrivalTime !== undefined) {
+                        const waitSeconds = time - arrivalTime;
+                        day.inboundDriverWaitingSeconds.push(waitSeconds);
+                        if (this.isHourWindow(arrivalTime, 8, 10)) {
+                            day.morningPeakInboundDriverWaitingSeconds.push(waitSeconds);
+                        }
+                    }
+                }
                 if (operation.type === "ParkInbound") {
                     day.successfulActivities += 1;
                     const arrivalTime = this.inboundEventTimeByVehicle.get(operation.vehicleId);
@@ -493,8 +982,10 @@ define("report/metrics-aggregator", ["require", "exports"], function (require, e
                 dayOfWeek: this.formatDatePart(time, "weekday"),
                 successfulActivities: 0,
                 vehiclesStayingUntilMidnight: 0,
+                inboundDriverWaitingSeconds: [],
                 inboundWaitSeconds: [],
                 outboundWaitSeconds: [],
+                morningPeakInboundDriverWaitingSeconds: [],
                 morningPeakInboundWaitSeconds: [],
                 eveningPeakOutboundWaitSeconds: [],
                 biggestInboundQueueLength: 0,
@@ -579,10 +1070,13 @@ define("report/summary", ["require", "exports"], function (require, exports) {
     const numericFields = [
         "successfulActivities",
         "vehiclesStayingUntilMidnight",
+        "averageInboundDriverWaitingSeconds",
         "averageInboundWaitSeconds",
         "averageOutboundWaitSeconds",
+        "averageInboundDriverWaitingSecondsDuringMorningPeak",
         "averageInboundWaitSecondsDuringMorningPeak",
         "averageOutboundWaitSecondsDuringEveningPeak",
+        "longestInboundDriverWaitingSeconds",
         "longestInboundWaitSeconds",
         "longestOutboundWaitSeconds",
         "biggestInboundQueueLength",
@@ -620,10 +1114,13 @@ define("report/summary", ["require", "exports"], function (require, exports) {
         return {
             successfulActivities: 0,
             vehiclesStayingUntilMidnight: 0,
+            averageInboundDriverWaitingSeconds: 0,
             averageInboundWaitSeconds: 0,
             averageOutboundWaitSeconds: 0,
+            averageInboundDriverWaitingSecondsDuringMorningPeak: 0,
             averageInboundWaitSecondsDuringMorningPeak: 0,
             averageOutboundWaitSecondsDuringEveningPeak: 0,
+            longestInboundDriverWaitingSeconds: 0,
             longestInboundWaitSeconds: 0,
             longestOutboundWaitSeconds: 0,
             biggestInboundQueueLength: 0,
@@ -827,12 +1324,36 @@ define("garage/grid-layout", ["require", "exports"], function (require, exports)
             }
             return geometry;
         }
-        classifyBlockage(cellId, _occupancy) {
-            const { row, column } = this.getCellGeometry(cellId);
-            const corner = (row === 1 || row === this.config.rows) && (column === 1 || column === this.config.columns);
-            if (!corner)
+        getBlockingCells(cellId, occupancy) {
+            const target = this.getCellGeometry(cellId);
+            const centerRow = Math.ceil(this.config.rows / 2);
+            const centerColumn = Math.ceil(this.config.columns / 2);
+            const occupied = new Set(occupancy.occupied.map((cell) => cell.cellId));
+            const horizontalFirst = this.buildPath(target.floor, centerRow, centerColumn, target.row, target.column, true);
+            const verticalFirst = this.buildPath(target.floor, centerRow, centerColumn, target.row, target.column, false);
+            const candidates = [horizontalFirst, verticalFirst]
+                .map((path) => path.filter((pathCell) => pathCell !== cellId && occupied.has(pathCell)))
+                .sort((a, b) => a.length - b.length || a.join(",").localeCompare(b.join(",")));
+            return candidates[0] ?? [];
+        }
+        wouldCreateBlockedEmptyCell(cellId, occupancy) {
+            const candidateOccupancy = {
+                ...occupancy,
+                occupied: [
+                    ...occupancy.occupied,
+                    { cellId, vehicleId: "__candidate__", parkedAt: 0 },
+                ],
+                occupiedCount: occupancy.occupiedCount + 1,
+            };
+            const occupied = new Set(candidateOccupancy.occupied.map((cell) => cell.cellId));
+            return this.parkingCells.some((parkingCell) => !occupied.has(parkingCell) &&
+                this.getBlockingCells(parkingCell, candidateOccupancy).length > 0);
+        }
+        classifyBlockage(cellId, occupancy) {
+            const blockerCount = this.getBlockingCells(cellId, occupancy).length;
+            if (blockerCount === 0)
                 return "none";
-            return this.config.rows >= 5 && this.config.columns >= 5 ? "deep" : "shallow";
+            return blockerCount === 1 ? "shallow" : "deep";
         }
         estimateAccessCost(cellId, occupancy) {
             const geometry = this.getCellGeometry(cellId);
@@ -842,10 +1363,213 @@ define("garage/grid-layout", ["require", "exports"], function (require, exports)
                 Math.abs(geometry.column - Math.ceil(this.config.columns / 2));
             return geometry.floor * 10 + manhattanFromElevator * 5 + blockagePenalty;
         }
+        buildPath(floor, startRow, startColumn, targetRow, targetColumn, horizontalFirst) {
+            const coordinates = [];
+            let row = startRow;
+            let column = startColumn;
+            const moveHorizontal = () => {
+                while (column !== targetColumn) {
+                    column += Math.sign(targetColumn - column);
+                    coordinates.push([row, column]);
+                }
+            };
+            const moveVertical = () => {
+                while (row !== targetRow) {
+                    row += Math.sign(targetRow - row);
+                    coordinates.push([row, column]);
+                }
+            };
+            if (horizontalFirst) {
+                moveHorizontal();
+                moveVertical();
+            }
+            else {
+                moveVertical();
+                moveHorizontal();
+            }
+            return coordinates
+                .map(([pathRow, pathColumn]) => this.cellIdAt(floor, pathRow, pathColumn))
+                .filter((pathCell) => pathCell !== null);
+        }
+        cellIdAt(floor, row, column) {
+            if (row < 1 || row > this.config.rows || column < 1 || column > this.config.columns) {
+                return null;
+            }
+            const cellNumber = (row - 1) * this.config.columns + column;
+            if (cellNumber === this.config.elevatorCell || this.config.unavailableCells.includes(cellNumber)) {
+                return null;
+            }
+            return `f${floor}c${cellNumber}`;
+        }
     }
     exports.GridGarageLayout = GridGarageLayout;
 });
-define("garage/simple-garage", ["require", "exports", "garage/grid-layout"], function (require, exports, grid_layout_js_1) {
+define("garage/vmr-path-planner", ["require", "exports"], function (require, exports) {
+    "use strict";
+    Object.defineProperty(exports, "__esModule", { value: true });
+    exports.GridVmrPathPlanner = void 0;
+    class GridVmrPathPlanner {
+        constructor(config, layout) {
+            this.config = config;
+            this.layout = layout;
+            const cell = config.layout.elevatorCell;
+            this.elevatorCoordinate = {
+                row: Math.floor((cell - 1) / config.layout.columns) + 1,
+                column: ((cell - 1) % config.layout.columns) + 1,
+            };
+        }
+        findAccessPlan(cellId, occupancy) {
+            const path = this.findPath(cellId, occupancy, true);
+            if (!path)
+                return null;
+            const occupied = new Set(occupancy.occupied.map((cell) => cell.cellId));
+            return {
+                path,
+                blockerCells: path.cells.filter((pathCell) => pathCell !== cellId && occupied.has(pathCell)),
+            };
+        }
+        findClearPathFromElevator(cellId, occupancy) {
+            const path = this.findPath(cellId, occupancy, false);
+            if (!path)
+                return null;
+            return this.isClear(path, occupancy, cellId, false)
+                ? this.roundTrip(path)
+                : null;
+        }
+        findClearPathToElevator(cellId, occupancy) {
+            const outward = this.findPath(cellId, occupancy, false);
+            if (!outward || !this.isClear(outward, occupancy, cellId, true))
+                return null;
+            return this.roundTrip(outward);
+        }
+        isClear(path, occupancy, endpointCell, endpointMayBeOccupied) {
+            const occupied = new Set(occupancy.occupied.map((cell) => cell.cellId));
+            return path.cells.every((cellId) => !occupied.has(cellId) ||
+                (cellId === endpointCell && endpointMayBeOccupied));
+        }
+        pathsConflict(a, b) {
+            if (a.floor !== b.floor)
+                return false;
+            const locations = new Set(a.locations);
+            return b.locations.some((location) => locations.has(location));
+        }
+        findPath(cellId, occupancy, minimizeBlockers) {
+            const target = this.layout.getCellGeometry(cellId);
+            const floor = target.floor;
+            const startKey = this.coordinateKey(this.elevatorCoordinate);
+            const targetKey = this.coordinateKey(target);
+            const occupied = new Set(occupancy.occupied.map((cell) => cell.cellId));
+            const frontier = [
+                { key: startKey, blockers: 0, steps: 0 },
+            ];
+            const best = new Map([
+                [startKey, { blockers: 0, steps: 0 }],
+            ]);
+            const previous = new Map();
+            while (frontier.length > 0) {
+                frontier.sort((a, b) => a.blockers - b.blockers ||
+                    a.steps - b.steps ||
+                    a.key.localeCompare(b.key));
+                const current = frontier.shift();
+                if (!current)
+                    break;
+                if (current.key === targetKey) {
+                    return this.buildPath(floor, current.key, previous);
+                }
+                for (const neighbor of this.neighbors(current.key)) {
+                    const neighborCell = this.cellAt(floor, neighbor);
+                    if (neighbor !== targetKey && neighborCell === null)
+                        continue;
+                    if (!minimizeBlockers &&
+                        neighbor !== targetKey &&
+                        neighborCell &&
+                        occupied.has(neighborCell)) {
+                        continue;
+                    }
+                    const blockerCost = minimizeBlockers && neighborCell && occupied.has(neighborCell) ? 1 : 0;
+                    const next = {
+                        blockers: current.blockers + blockerCost,
+                        steps: current.steps + 1,
+                    };
+                    const known = best.get(neighbor);
+                    if (known &&
+                        (known.blockers < next.blockers ||
+                            (known.blockers === next.blockers && known.steps <= next.steps))) {
+                        continue;
+                    }
+                    best.set(neighbor, next);
+                    previous.set(neighbor, current.key);
+                    frontier.push({ key: neighbor, ...next });
+                }
+            }
+            return null;
+        }
+        buildPath(floor, targetKey, previous) {
+            const keys = [targetKey];
+            let cursor = targetKey;
+            while (previous.has(cursor)) {
+                cursor = previous.get(cursor);
+                keys.push(cursor);
+            }
+            keys.reverse();
+            const locations = keys.map((key) => key === this.coordinateKey(this.elevatorCoordinate)
+                ? this.elevatorLocation(floor)
+                : this.cellAt(floor, key));
+            const cells = locations.filter((location) => location.startsWith("f"));
+            return {
+                floor,
+                locations,
+                cells,
+                distanceMeters: Math.max(0, locations.length - 1) * 3,
+            };
+        }
+        roundTrip(path) {
+            const returnLocations = [...path.locations].reverse().slice(1);
+            const locations = [...path.locations, ...returnLocations];
+            return {
+                ...path,
+                locations,
+                cells: locations.filter((location) => location.startsWith("f")),
+                distanceMeters: path.distanceMeters * 2,
+            };
+        }
+        neighbors(key) {
+            const coordinate = this.parseCoordinate(key);
+            return [
+                { row: coordinate.row - 1, column: coordinate.column },
+                { row: coordinate.row + 1, column: coordinate.column },
+                { row: coordinate.row, column: coordinate.column - 1 },
+                { row: coordinate.row, column: coordinate.column + 1 },
+            ]
+                .filter((candidate) => candidate.row >= 1 &&
+                candidate.row <= this.config.layout.rows &&
+                candidate.column >= 1 &&
+                candidate.column <= this.config.layout.columns)
+                .map((candidate) => this.coordinateKey(candidate));
+        }
+        cellAt(floor, key) {
+            const coordinate = this.parseCoordinate(key);
+            const cellNumber = (coordinate.row - 1) * this.config.layout.columns + coordinate.column;
+            if (cellNumber === this.config.layout.elevatorCell)
+                return null;
+            if (this.config.layout.unavailableCells.includes(cellNumber))
+                return null;
+            return `f${floor}c${cellNumber}`;
+        }
+        elevatorLocation(floor) {
+            return `f${floor}:elevator`;
+        }
+        coordinateKey(coordinate) {
+            return `${coordinate.row},${coordinate.column}`;
+        }
+        parseCoordinate(key) {
+            const [row, column] = key.split(",").map(Number);
+            return { row: row ?? 0, column: column ?? 0 };
+        }
+    }
+    exports.GridVmrPathPlanner = GridVmrPathPlanner;
+});
+define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "garage/vmr-path-planner"], function (require, exports, grid_layout_js_1, vmr_path_planner_js_1) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
     exports.SimpleGarageTowerSystem = void 0;
@@ -857,85 +1581,93 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout"], fun
             this.parked = new Map();
             this.requestedOutbound = new Set();
             this.preparationPositions = [];
-            this.activeOperation = null;
-            this.operationDuration = 0;
+            this.decks = [];
             this.vmrs = [];
-            this.counters = {
-                inboundAccepted: 0,
-                outboundAccepted: 0,
-                inboundBalked: 0,
-                inboundCompleted: 0,
-                outboundCompleted: 0,
-                rejectedEvents: 0,
-                maxInboundQueueLength: 0,
-                maxOutboundQueueLength: 0,
-                elevatorFloorsPassed: 0,
-                vmrDistanceMeters: 0,
-                inducedInboundTrips: 0,
-                inducedInboundVehicles: 0,
-                idleUnblockingActions: 0,
-                idleUnblockedVehicles: 0,
-                downwardTripPlacements: 0,
-            };
+            this.trip = null;
+            this.elevatorFloor = 1;
+            this.elevatorDirection = "stopped";
+            this.lastExternalActivityAt = 0;
+            this.counters = this.newCounters();
         }
         initialize(config) {
             this.config = config;
             this.layout = new grid_layout_js_1.GridGarageLayout(config.layout);
+            this.pathPlanner = new vmr_path_planner_js_1.GridVmrPathPlanner(config, this.layout);
+            this.inboundQueue = [];
+            this.outboundQueue = [];
+            this.parked.clear();
+            this.requestedOutbound.clear();
+            this.trip = null;
+            this.elevatorFloor = 1;
+            this.elevatorDirection = "stopped";
+            this.lastExternalActivityAt = 0;
+            this.counters = this.newCounters();
             this.preparationPositions = [
                 ...Array.from({ length: config.preparationPositions.inboundCount }, (_, index) => ({
                     id: `IPP${index + 1}`,
                     direction: "inbound",
+                    doorState: "open",
                 })),
                 ...Array.from({ length: config.preparationPositions.outboundCount }, (_, index) => ({
                     id: `OPP${index + 1}`,
                     direction: "outbound",
+                    doorState: "closed",
                 })),
             ];
-            this.vmrs = Array.from({ length: config.elevator.deckCount }, (_, index) => ({
-                id: `VMR${index + 1}`,
-                deckId: `D${index + 1}`,
+            this.decks = Array.from({ length: config.elevator.deckCount }, (_, index) => ({
+                id: `D${index + 1}`,
+                index,
+                alignedFloor: 1 - index,
+                orientation: "garage",
+                vmrId: `VMR${index + 1}`,
+            }));
+            this.vmrs = this.decks.map((deck) => ({
+                id: deck.vmrId,
+                deckId: deck.id,
+                homeDeckId: deck.id,
                 status: "Idle",
                 distanceMovedMeters: 0,
             }));
         }
         submitEvents(context) {
-            const results = [];
-            for (const event of context.events) {
-                if (event.type === "InboundArrival") {
-                    results.push(this.submitInbound(event.id, event.vehicleId, context));
-                }
-                else {
-                    results.push(this.submitOutbound(event.id, event.vehicleId, context.time));
-                }
+            if (context.events.length > 0) {
+                this.lastExternalActivityAt = context.time;
             }
+            const results = context.events.map((event) => event.type === "InboundArrival"
+                ? this.submitInbound(event.id, event.vehicleId, context)
+                : this.submitOutbound(event.id, event.vehicleId, context.time));
             this.updateMaxQueues();
             return results;
         }
         updateOneSecond(context) {
-            this.clearReadyOutboundPreparationPositions(context.time);
-            this.fillInboundPreparationPositions(context.time);
-            const completedOperations = [];
-            if (this.activeOperation && context.time >= this.activeOperation.completesAt) {
-                completedOperations.push(this.completeActiveOperation(context.time));
-            }
+            this.updatePreparationPositions(context.time);
+            const completedOperations = this.fillInboundPreparationPositions(context.time);
             const startedOperations = [];
-            if (!this.activeOperation) {
-                const nextOperation = this.startNextOperation(context);
-                if (nextOperation) {
-                    startedOperations.push(nextOperation);
-                }
+            if (this.trip?.activeGroup && context.time >= this.trip.activeGroup.completesAt) {
+                completedOperations.push(...this.completeActiveGroup(context.time));
+            }
+            if (this.trip && !this.trip.activeGroup && this.trip.groupIndex >= this.trip.groups.length) {
+                this.finishTrip(context.time);
+            }
+            if (!this.trip) {
+                this.trip = this.planTrip(context);
+            }
+            if (this.trip && !this.trip.activeGroup) {
+                startedOperations.push(...this.startNextGroup(context));
             }
             this.updateMaxQueues();
             return { completedOperations, startedOperations };
         }
         getSnapshot() {
             const occupancy = this.getOccupancy();
-            const elevator = {
-                status: this.activeOperation ? "Busy" : "IdleAtHome",
-                currentFloor: this.activeOperation ? this.estimateOperationFloor(this.activeOperation) : 1,
-                deckCount: this.config.elevator.deckCount,
-                ...(this.activeOperation ? { activeOperationId: this.activeOperation.id } : {}),
-            };
+            const activeOperations = this.trip?.activeGroup?.operations.map((operation) => ({ ...operation })) ?? [];
+            const activeTrip = this.trip
+                ? {
+                    ...this.trip.state,
+                    phase: this.trip.activeGroup?.group.name ?? "planning",
+                    routeIndex: this.trip.groupIndex,
+                }
+                : undefined;
             return {
                 time: 0,
                 occupancy,
@@ -945,15 +1677,32 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout"], fun
                     inboundLength: this.inboundQueue.length,
                     outboundLength: this.outboundQueue.length,
                 },
-                elevator,
+                elevator: {
+                    status: this.trip ? "Busy" : "IdleAtHome",
+                    currentFloor: this.elevatorFloor,
+                    deckCount: this.decks.length,
+                    direction: this.elevatorDirection,
+                    decks: this.decks.map((deck) => ({
+                        ...deck,
+                        alignedFloor: this.elevatorFloor - deck.index,
+                    })),
+                    ...(activeTrip ? { activeTrip } : {}),
+                    ...(activeOperations[0] ? { activeOperationId: activeOperations[0].id } : {}),
+                },
                 preparationPositions: this.preparationPositions.map((position) => ({ ...position })),
-                vmrs: this.vmrs.map((vmr) => ({ ...vmr })),
+                vmrs: this.vmrs.map((vmr) => ({
+                    ...vmr,
+                    ...(vmr.currentTask ? { currentTask: { ...vmr.currentTask } } : {}),
+                })),
                 counters: { ...this.counters },
-                activeOperations: this.activeOperation ? [{ ...this.activeOperation }] : [],
+                activeOperations,
             };
         }
         isIdle() {
-            return !this.activeOperation && this.inboundQueue.length === 0 && this.outboundQueue.length === 0;
+            return (!this.trip &&
+                this.inboundQueue.length === 0 &&
+                this.outboundQueue.length === 0 &&
+                !this.preparationPositions.some((position) => position.occupiedBy));
         }
         getCapacity() {
             const totalParkingCells = this.layout.getParkingCells().length;
@@ -964,20 +1713,19 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout"], fun
             };
         }
         submitInbound(eventId, vehicleId, context) {
-            const capacity = this.getCapacity();
-            const inboundInSystem = this.inboundQueue.length + this.occupiedInboundPreparationPositions().length;
-            if (capacity.availableParkingCells <= inboundInSystem) {
+            const available = this.getCapacity().availableParkingCells;
+            const reservedInbound = this.inboundQueue.length + this.inboundVehiclesInPhysicalSystem();
+            if (available <= reservedInbound) {
                 this.counters.rejectedEvents += 1;
                 return {
                     eventId,
                     vehicleId,
                     accepted: false,
                     outcome: "RejectedGarageFull",
-                    reason: "No parking cell is available for another inbound vehicle.",
+                    reason: "No unreserved parking cell is available for another inbound vehicle.",
                 };
             }
-            const queueLengthExcludingPps = this.inboundQueue.length;
-            if (this.shouldBalk(queueLengthExcludingPps, context)) {
+            if (this.shouldBalk(this.inboundQueue.length, context)) {
                 this.counters.inboundBalked += 1;
                 return {
                     eventId,
@@ -1029,179 +1777,416 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout"], fun
                 queuePosition: this.outboundQueue.length,
             };
         }
-        startNextOperation(context) {
-            const readyInbound = this.preparationPositions.find((position) => position.direction === "inbound" && position.occupiedBy && (position.readyAt ?? 0) <= context.time);
-            if (readyInbound?.occupiedBy) {
-                return this.startParkingOperation(readyInbound, context);
-            }
-            if (this.outboundQueue.length > 0) {
-                return this.startRetrievalOperation(context);
-            }
-            return null;
-        }
-        startParkingOperation(position, context) {
-            const vehicleId = position.occupiedBy;
-            if (!vehicleId)
-                return null;
-            const cellId = this.strategies.placementStrategy.chooseCell(vehicleId, { time: context.time, layout: this.layout, occupancy: this.getOccupancy() }, context.rng);
-            if (!cellId)
-                return null;
-            delete position.occupiedBy;
-            delete position.readyAt;
-            const duration = this.estimateParkingSeconds(cellId);
-            const operation = {
-                id: `op-${context.time}-${vehicleId}`,
-                type: "ParkInbound",
-                vehicleId,
-                startedAt: context.time,
-                completesAt: context.time + duration,
-                from: position.id,
-                to: cellId,
-            };
-            this.activateOperation(operation, duration, cellId);
-            context.telemetry.recordOperation({
+        planTrip(context) {
+            const snapshot = this.getSnapshot();
+            snapshot.time = context.time;
+            const idleSeconds = context.time - this.lastExternalActivityAt;
+            const idleUnblockingAllowed = this.strategies.unblockingStrategy.shouldStartIdleUnblocking({
                 time: context.time,
-                type: "ParkInboundStarted",
-                vehicleId,
-                detail: { cellId, duration },
+                snapshot,
+                idleSeconds,
             });
-            return operation;
-        }
-        startRetrievalOperation(context) {
-            const next = this.outboundQueue.shift();
-            if (!next)
-                return null;
-            const parked = this.parked.get(next.vehicleId);
-            if (!parked) {
-                this.requestedOutbound.delete(next.vehicleId);
-                return null;
-            }
-            const duration = this.estimateRetrievalSeconds(parked.cellId);
-            const operation = {
-                id: `op-${context.time}-${next.vehicleId}`,
-                type: "RetrieveOutbound",
-                vehicleId: next.vehicleId,
-                startedAt: context.time,
-                completesAt: context.time + duration,
-                from: parked.cellId,
-                to: "outbound-preparation-position",
-            };
-            this.activateOperation(operation, duration, parked.cellId);
-            context.telemetry.recordOperation({
+            const plan = this.strategies.tripPlanner.planNextTrip({
                 time: context.time,
-                type: "RetrieveOutboundStarted",
-                vehicleId: next.vehicleId,
-                detail: { cellId: parked.cellId, duration },
+                snapshot,
+                config: this.config,
+                layout: this.layout,
+                pathPlanner: this.pathPlanner,
+                placementStrategy: this.strategies.placementStrategy,
+                idleSeconds,
+                idleUnblockingAllowed,
             });
-            return operation;
-        }
-        completeActiveOperation(time) {
-            const operation = this.activeOperation;
-            if (!operation) {
-                throw new Error("No active operation to complete.");
-            }
-            this.activeOperation = null;
-            this.vmrs = this.vmrs.map((vmr) => ({ ...vmr, status: "Idle" }));
-            if (operation.type === "ParkInbound" && operation.vehicleId && operation.to) {
-                this.parked.set(operation.vehicleId, {
-                    vehicleId: operation.vehicleId,
-                    cellId: operation.to,
-                    parkedAt: time,
-                });
-                this.counters.inboundCompleted += 1;
-            }
-            if (operation.type === "RetrieveOutbound" && operation.vehicleId) {
-                this.parked.delete(operation.vehicleId);
-                this.requestedOutbound.delete(operation.vehicleId);
-                this.placeVehicleOnOutboundPreparationPosition(operation.vehicleId, time);
-                this.counters.outboundCompleted += 1;
+            if (!plan)
+                return null;
+            const selectedOutboundIds = new Set(plan.selectedOutboundVehicleIds);
+            this.outboundQueue = this.outboundQueue.filter((queued) => !selectedOutboundIds.has(queued.vehicleId));
+            if (plan.inducedInboundVehicles > 0) {
+                this.counters.inducedInboundTrips += 1;
+                this.counters.inducedInboundVehicles += plan.inducedInboundVehicles;
             }
             return {
-                type: operation.type,
-                durationSeconds: this.operationDuration,
-                detail: { from: operation.from, to: operation.to },
-                ...(operation.vehicleId ? { vehicleId: operation.vehicleId } : {}),
+                state: {
+                    id: plan.id,
+                    phase: plan.phase,
+                    startedAt: context.time,
+                    route: plan.stops,
+                    routeIndex: 0,
+                    inboundVehicleIds: plan.inboundVehicleIds,
+                    outboundVehicleIds: plan.outboundVehicleIds,
+                },
+                groups: plan.groups,
+                groupIndex: 0,
+                activeGroup: null,
             };
         }
-        activateOperation(operation, duration, cellId) {
-            this.activeOperation = operation;
-            this.operationDuration = duration;
-            this.vmrs = this.vmrs.map((vmr, index) => ({
-                ...vmr,
-                status: index === 0 ? "Busy" : vmr.status,
-            }));
-            const floor = this.layout.getCellFloor(cellId);
-            const floorsPassed = Math.max(0, (floor - 1) * 2);
-            const vmrDistance = this.layout.estimateAccessCost(cellId, this.getOccupancy()) / 2;
-            this.counters.elevatorFloorsPassed += floorsPassed;
-            this.counters.vmrDistanceMeters += vmrDistance;
-            this.vmrs[0] = {
-                ...this.vmrs[0],
-                distanceMovedMeters: (this.vmrs[0]?.distanceMovedMeters ?? 0) + vmrDistance,
-            };
-        }
-        fillInboundPreparationPositions(time) {
-            for (const position of this.preparationPositions) {
-                if (this.inboundQueue.length === 0)
-                    return;
-                if (position.direction !== "inbound" || position.occupiedBy)
-                    continue;
-                const next = this.inboundQueue.shift();
-                if (!next)
-                    return;
-                position.occupiedBy = next.vehicleId;
-                position.readyAt = time + this.preparationClearSeconds();
+        startNextGroup(context) {
+            if (!this.trip)
+                return [];
+            const group = this.trip.groups[this.trip.groupIndex];
+            if (!group)
+                return [];
+            if (group.name.startsWith("move-elevator-") && !this.allVmrsHomeAndIdle()) {
+                context.telemetry.recordWarning({
+                    time: context.time,
+                    message: "Elevator movement delayed until all VMRs return to their home decks.",
+                });
+                return [];
             }
+            this.validateActionGroupPaths(group);
+            if (group.elevatorDirection) {
+                this.elevatorDirection = group.elevatorDirection;
+            }
+            const operations = group.actions.map((action, index) => {
+                this.applyActionStart(action, context.time);
+                const operation = {
+                    id: `${this.trip?.state.id}-${this.trip?.groupIndex}-${index}`,
+                    type: action.type,
+                    startedAt: context.time,
+                    completesAt: context.time + action.durationSeconds,
+                    ...(action.vehicleId ? { vehicleId: action.vehicleId } : {}),
+                    ...(action.from ? { from: action.from } : {}),
+                    ...(action.to ? { to: action.to } : {}),
+                    ...(action.path ? { path: action.path } : {}),
+                };
+                if (action.deckIndex !== undefined && action.type !== "RotateDeck") {
+                    this.startVmrTask(action.deckIndex, operation);
+                }
+                context.telemetry.recordOperation({
+                    time: context.time,
+                    type: `${action.type}Started`,
+                    ...(action.vehicleId ? { vehicleId: action.vehicleId } : {}),
+                    detail: {
+                        tripId: this.trip?.state.id,
+                        group: group.name,
+                        from: action.from,
+                        to: action.to,
+                        durationSeconds: action.durationSeconds,
+                        path: action.path?.locations,
+                    },
+                });
+                return operation;
+            });
+            const completesAt = Math.max(...operations.map((operation) => operation.completesAt));
+            this.trip.activeGroup = { group, operations, completesAt };
+            return operations;
         }
-        placeVehicleOnOutboundPreparationPosition(vehicleId, time) {
-            const openPosition = this.preparationPositions.find((position) => position.direction === "outbound" && !position.occupiedBy);
-            if (!openPosition) {
+        completeActiveGroup(time) {
+            if (!this.trip?.activeGroup)
+                return [];
+            const { group, operations } = this.trip.activeGroup;
+            group.actions.forEach((action) => {
+                this.applyActionComplete(action, time);
+                if (action.deckIndex !== undefined && action.type !== "RotateDeck") {
+                    this.finishVmrTask(action.deckIndex);
+                }
+            });
+            const completed = operations.map((operation) => ({
+                type: operation.type,
+                durationSeconds: operation.completesAt - operation.startedAt,
+                detail: {
+                    from: operation.from,
+                    to: operation.to,
+                    group: group.name,
+                    path: operation.path?.locations,
+                },
+                ...(operation.vehicleId ? { vehicleId: operation.vehicleId } : {}),
+            }));
+            this.trip.activeGroup = null;
+            this.trip.groupIndex += 1;
+            return completed;
+        }
+        finishTrip(time) {
+            if (!this.trip)
+                return;
+            const wasNormalTrip = this.trip.state.inboundVehicleIds.length > 0 ||
+                this.trip.state.outboundVehicleIds.length > 0;
+            this.elevatorFloor = 1;
+            this.elevatorDirection = "stopped";
+            for (const deck of this.decks) {
+                deck.alignedFloor = 1 - deck.index;
+                deck.orientation = "garage";
+            }
+            for (const vmr of this.vmrs) {
+                vmr.status = "Idle";
+                delete vmr.currentTask;
+            }
+            if (wasNormalTrip) {
+                this.lastExternalActivityAt = Math.max(this.lastExternalActivityAt, time);
+            }
+            this.trip = null;
+        }
+        applyActionStart(action, time) {
+            if (action.type !== "OperateDoor" ||
+                !action.preparationPositionId ||
+                !action.doorFinalState) {
                 return;
             }
-            openPosition.occupiedBy = vehicleId;
-            openPosition.readyAt = time + this.preparationClearSeconds();
+            const position = this.findPp(action.preparationPositionId);
+            if (!position)
+                return;
+            position.doorState =
+                action.doorFinalState === "open" ? "opening" : "closing";
+            position.doorTransitionCompleteAt = time + action.durationSeconds;
         }
-        clearReadyOutboundPreparationPositions(time) {
+        applyActionComplete(action, time) {
+            const deck = action.deckIndex === undefined ? undefined : this.decks[action.deckIndex];
+            switch (action.type) {
+                case "MoveElevator": {
+                    const from = this.elevatorPosition(action.from);
+                    const to = this.elevatorPosition(action.to);
+                    this.counters.elevatorFloorsPassed += Math.abs(to - from);
+                    this.elevatorFloor = to;
+                    this.decks.forEach((candidate) => {
+                        candidate.alignedFloor = to - candidate.index;
+                    });
+                    break;
+                }
+                case "RotateDeck":
+                    if (deck && (action.to === "garage" || action.to === "street")) {
+                        deck.orientation = action.to;
+                    }
+                    break;
+                case "OperateDoor": {
+                    const position = action.preparationPositionId
+                        ? this.findPp(action.preparationPositionId)
+                        : undefined;
+                    if (!position || !action.doorFinalState)
+                        break;
+                    position.doorState = action.doorFinalState;
+                    delete position.doorTransitionCompleteAt;
+                    if (action.setDriverReady && position.occupiedBy) {
+                        position.readyAt = time + this.preparationClearSeconds();
+                    }
+                    break;
+                }
+                case "LoadInbound": {
+                    const position = action.preparationPositionId
+                        ? this.findPp(action.preparationPositionId)
+                        : undefined;
+                    if (position) {
+                        delete position.occupiedBy;
+                        delete position.readyAt;
+                    }
+                    if (deck && action.vehicleId) {
+                        deck.vehicleId = action.vehicleId;
+                        deck.vehicleRole = "inbound";
+                    }
+                    break;
+                }
+                case "MoveBlocker":
+                    if (action.vehicleId) {
+                        this.parked.delete(action.vehicleId);
+                        if (deck) {
+                            deck.vehicleId = action.vehicleId;
+                            deck.vehicleRole = "blocker";
+                        }
+                    }
+                    break;
+                case "LoadOutbound":
+                    if (action.vehicleId) {
+                        this.parked.delete(action.vehicleId);
+                        if (deck) {
+                            deck.vehicleId = action.vehicleId;
+                            deck.vehicleRole = "outbound";
+                        }
+                    }
+                    break;
+                case "RelocateBlocker":
+                    if (action.vehicleId && action.to) {
+                        this.parked.set(action.vehicleId, {
+                            vehicleId: action.vehicleId,
+                            cellId: action.to,
+                            parkedAt: time,
+                        });
+                    }
+                    if (action.deckIndex !== undefined)
+                        this.clearDeck(action.deckIndex);
+                    break;
+                case "ParkInbound":
+                    if (action.vehicleId && action.to) {
+                        this.parked.set(action.vehicleId, {
+                            vehicleId: action.vehicleId,
+                            cellId: action.to,
+                            parkedAt: time,
+                        });
+                        this.counters.inboundCompleted += 1;
+                        this.counters.downwardTripPlacements += 1;
+                    }
+                    if (action.deckIndex !== undefined)
+                        this.clearDeck(action.deckIndex);
+                    break;
+                case "RetrieveOutbound": {
+                    const position = action.preparationPositionId
+                        ? this.findPp(action.preparationPositionId)
+                        : undefined;
+                    if (position && action.vehicleId) {
+                        position.occupiedBy = action.vehicleId;
+                        position.doorState = "closed";
+                    }
+                    if (action.deckIndex !== undefined)
+                        this.clearDeck(action.deckIndex);
+                    if (action.vehicleId) {
+                        this.requestedOutbound.delete(action.vehicleId);
+                        this.counters.outboundCompleted += 1;
+                    }
+                    break;
+                }
+                case "IdleUnblock":
+                    if (action.vehicleId && action.to) {
+                        this.parked.set(action.vehicleId, {
+                            vehicleId: action.vehicleId,
+                            cellId: action.to,
+                            parkedAt: time,
+                        });
+                        this.counters.idleUnblockingActions += 1;
+                        this.counters.idleUnblockedVehicles += 1;
+                    }
+                    if (action.deckIndex !== undefined)
+                        this.clearDeck(action.deckIndex);
+                    break;
+                case "UnloadOutbound":
+                case "EnterInboundPreparationPosition":
+                    break;
+            }
+        }
+        elevatorPosition(location) {
+            const value = Number(location?.slice("elevator-position-".length));
+            return Number.isFinite(value) ? value : this.elevatorFloor;
+        }
+        updatePreparationPositions(time) {
             for (const position of this.preparationPositions) {
-                if (position.direction === "outbound" && position.occupiedBy && (position.readyAt ?? 0) <= time) {
+                if (position.direction === "outbound" &&
+                    position.doorState === "open" &&
+                    position.occupiedBy &&
+                    (position.readyAt ?? Number.POSITIVE_INFINITY) <= time) {
                     delete position.occupiedBy;
                     delete position.readyAt;
+                    position.doorState = "closing";
+                    position.doorTransitionCompleteAt =
+                        time + this.config.preparationPositions.doorSeconds;
+                }
+                if (position.doorTransitionCompleteAt !== undefined &&
+                    position.doorTransitionCompleteAt <= time) {
+                    position.doorState =
+                        position.doorState === "closing" ? "closed" : "open";
+                    delete position.doorTransitionCompleteAt;
                 }
             }
         }
-        shouldBalk(queueLengthExcludingPps, context) {
-            const policy = context.rng ? context : undefined;
-            if (!policy)
-                return false;
-            const balking = {
-                startsAtQueueLength: 13,
-                initialProbability: 0.5,
-                probabilityStep: 0.1,
-                certainAtQueueLength: 18,
+        fillInboundPreparationPositions(time) {
+            const completed = [];
+            const inboundPositions = this.preparationPositions.filter((position) => position.direction === "inbound");
+            for (const position of inboundPositions) {
+                if (this.inboundQueue.length === 0)
+                    return completed;
+                if (position.doorState !== "open" || position.occupiedBy)
+                    continue;
+                if (this.config.preparationPositions.kind === "sequential" &&
+                    inboundPositions.some((candidate) => Number(candidate.id.slice(3)) < Number(position.id.slice(3)) &&
+                        !candidate.occupiedBy)) {
+                    continue;
+                }
+                const next = this.inboundQueue.shift();
+                if (!next)
+                    return completed;
+                position.occupiedBy = next.vehicleId;
+                position.readyAt = time + this.preparationClearSeconds();
+                completed.push({
+                    type: "EnterInboundPreparationPosition",
+                    vehicleId: next.vehicleId,
+                    durationSeconds: 0,
+                    detail: {
+                        preparationPositionId: position.id,
+                        queuedAt: next.queuedAt,
+                    },
+                });
+            }
+            return completed;
+        }
+        startVmrTask(index, operation) {
+            const vmr = this.vmrs[index];
+            if (!vmr)
+                return;
+            vmr.status = "Busy";
+            vmr.currentTask = {
+                type: operation.type,
+                startedAt: operation.startedAt,
+                completesAt: operation.completesAt,
+                ...(operation.from ? { from: operation.from } : {}),
+                ...(operation.to ? { to: operation.to } : {}),
+                ...(operation.vehicleId ? { vehicleId: operation.vehicleId } : {}),
+                ...(operation.path ? { path: operation.path } : {}),
             };
-            const queuePosition = queueLengthExcludingPps + 1;
-            if (queuePosition < balking.startsAtQueueLength)
-                return false;
-            if (queuePosition >= balking.certainAtQueueLength)
-                return true;
-            const probability = balking.initialProbability +
-                (queuePosition - balking.startsAtQueueLength) * balking.probabilityStep;
-            return context.rng.nextFloat() < probability;
         }
-        preparationClearSeconds() {
-            return this.config.preparationPositions.kind === "sequential"
-                ? this.config.preparationPositions.sequentialClearSeconds
-                : this.config.preparationPositions.parallelClearSeconds;
+        finishVmrTask(index) {
+            const vmr = this.vmrs[index];
+            if (!vmr)
+                return;
+            const task = vmr.currentTask;
+            if (task) {
+                const distance = task.path?.distanceMeters ?? this.taskDistance(task.from, task.to);
+                vmr.distanceMovedMeters += distance;
+                this.counters.vmrDistanceMeters += distance;
+            }
+            vmr.status = "Idle";
+            delete vmr.currentTask;
         }
-        estimateParkingSeconds(cellId) {
-            const floor = this.layout.getCellFloor(cellId);
-            const verticalMeters = Math.max(0, floor - 1) * this.config.elevator.floorHeightMeters;
-            const verticalSeconds = verticalMeters / this.config.elevator.verticalSpeedMetersPerSecond;
-            const accessSeconds = this.layout.estimateAccessCost(cellId, this.getOccupancy());
-            return Math.ceil(verticalSeconds * 2 + accessSeconds + this.config.vmr.gripReleaseSeconds * 2);
+        allVmrsHomeAndIdle() {
+            return this.vmrs.every((vmr) => vmr.status === "Idle" && vmr.deckId === vmr.homeDeckId);
         }
-        estimateRetrievalSeconds(cellId) {
-            return this.estimateParkingSeconds(cellId);
+        validateActionGroupPaths(group) {
+            const pathActions = group.actions.filter((action) => Boolean(action.path));
+            for (let index = 0; index < pathActions.length; index += 1) {
+                for (let otherIndex = index + 1; otherIndex < pathActions.length; otherIndex += 1) {
+                    const first = pathActions[index];
+                    const second = pathActions[otherIndex];
+                    if (first &&
+                        second &&
+                        this.pathPlanner.pathsConflict(first.path, second.path)) {
+                        throw new Error(`Concurrent VMR paths conflict in group '${group.name}': ` +
+                            `${first.vehicleId ?? first.type} and ${second.vehicleId ?? second.type}.`);
+                    }
+                }
+            }
+            const occupancy = this.getOccupancy();
+            for (const action of pathActions) {
+                const extraction = action.type === "MoveBlocker" || action.type === "LoadOutbound";
+                const endpoint = extraction ? action.from : action.to;
+                if (!endpoint?.startsWith("f"))
+                    continue;
+                if (!this.pathPlanner.isClear(action.path, occupancy, endpoint, extraction)) {
+                    throw new Error(`VMR path is obstructed for ${action.type} ${action.vehicleId ?? ""}: ` +
+                        action.path.locations.join(" -> "));
+                }
+            }
+        }
+        clearDeck(index) {
+            const deck = this.decks[index];
+            if (!deck)
+                return;
+            delete deck.vehicleId;
+            delete deck.vehicleRole;
+        }
+        findPp(id) {
+            return this.preparationPositions.find((position) => position.id === id);
+        }
+        taskDistance(from, to) {
+            const cell = [from, to].find((value) => value?.startsWith("f"));
+            if (cell) {
+                const geometry = this.layout.getCellGeometry(cell);
+                const centerRow = Math.ceil(this.config.layout.rows / 2);
+                const centerColumn = Math.ceil(this.config.layout.columns / 2);
+                return ((Math.abs(geometry.row - centerRow) +
+                    Math.abs(geometry.column - centerColumn)) *
+                    3 *
+                    2);
+            }
+            const pp = [from, to].find((value) => value?.includes("PP"));
+            if (pp) {
+                const positionNumber = Number(/\d+$/.exec(pp)?.[0] ?? 1);
+                return Math.max(3, positionNumber * 3) * 2;
+            }
+            return 0;
         }
         getOccupancy() {
             const occupied = [...this.parked.values()].map((record) => ({
@@ -1217,18 +2202,54 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout"], fun
                 occupancyPercent: totalParkingCells === 0 ? 0 : occupied.length / totalParkingCells,
             };
         }
-        occupiedInboundPreparationPositions() {
-            return this.preparationPositions.filter((position) => position.direction === "inbound" && position.occupiedBy);
+        inboundVehiclesInPhysicalSystem() {
+            const onPps = this.preparationPositions.filter((position) => position.direction === "inbound" && position.occupiedBy).length;
+            const onDecks = this.decks.filter((deck) => deck.vehicleRole === "inbound" && deck.vehicleId).length;
+            return onPps + onDecks;
         }
         updateMaxQueues() {
             this.counters.maxInboundQueueLength = Math.max(this.counters.maxInboundQueueLength, this.inboundQueue.length);
             this.counters.maxOutboundQueueLength = Math.max(this.counters.maxOutboundQueueLength, this.outboundQueue.length);
         }
-        estimateOperationFloor(operation) {
-            const cell = operation.type === "ParkInbound" ? operation.to : operation.from;
-            if (!cell || !cell.startsWith("f"))
-                return 1;
-            return this.layout.getCellFloor(cell);
+        shouldBalk(queueLengthExcludingPps, context) {
+            const policy = {
+                startsAtQueueLength: 13,
+                initialProbability: 0.5,
+                probabilityStep: 0.1,
+                certainAtQueueLength: 18,
+            };
+            const queuePosition = queueLengthExcludingPps + 1;
+            if (queuePosition < policy.startsAtQueueLength)
+                return false;
+            if (queuePosition >= policy.certainAtQueueLength)
+                return true;
+            const probability = policy.initialProbability +
+                (queuePosition - policy.startsAtQueueLength) * policy.probabilityStep;
+            return context.rng.nextFloat() < probability;
+        }
+        preparationClearSeconds() {
+            return this.config.preparationPositions.kind === "sequential"
+                ? this.config.preparationPositions.sequentialClearSeconds
+                : this.config.preparationPositions.parallelClearSeconds;
+        }
+        newCounters() {
+            return {
+                inboundAccepted: 0,
+                outboundAccepted: 0,
+                inboundBalked: 0,
+                inboundCompleted: 0,
+                outboundCompleted: 0,
+                rejectedEvents: 0,
+                maxInboundQueueLength: 0,
+                maxOutboundQueueLength: 0,
+                elevatorFloorsPassed: 0,
+                vmrDistanceMeters: 0,
+                inducedInboundTrips: 0,
+                inducedInboundVehicles: 0,
+                idleUnblockingActions: 0,
+                idleUnblockedVehicles: 0,
+                downwardTripPlacements: 0,
+            };
         }
     }
     exports.SimpleGarageTowerSystem = SimpleGarageTowerSystem;
@@ -1265,11 +2286,22 @@ define("simulation/demand-generator", ["require", "exports", "simulation/random"
     class SeededDemandGenerator {
         constructor() {
             this.nextVehicleNumber = 1;
-            this.scheduledOutbounds = [];
+            this.futureOutbounds = [];
+            this.dueOutbounds = new Map();
+            this.canceledInboundEventIds = new Set();
+            this.startLocalSecondOfDay = 0;
+            this.weekendByDayOffset = new Map();
         }
-        initialize(params, seed) {
+        initialize(params, runtime, seed) {
             this.config = params;
+            this.runtime = runtime;
             this.rng = new random_js_1.SeededRandomSource(seed);
+            this.startLocalSecondOfDay = this.getStartLocalSecondOfDay();
+            this.futureOutbounds.length = 0;
+            this.dueOutbounds.clear();
+            this.canceledInboundEventIds.clear();
+            this.weekendByDayOffset.clear();
+            this.nextVehicleNumber = 1;
         }
         generateEventsAt(time, garageState) {
             const events = [];
@@ -1277,34 +2309,74 @@ define("simulation/demand-generator", ["require", "exports", "simulation/random"
             for (let index = 0; index < inboundCount; index += 1) {
                 const vehicleId = `V${this.nextVehicleNumber.toString().padStart(6, "0")}`;
                 this.nextVehicleNumber += 1;
-                events.push({ id: `evt-${time}-in-${vehicleId}`, time, type: "InboundArrival", vehicleId });
-                this.scheduledOutbounds.push({
+                const inboundEventId = `evt-${time}-in-${vehicleId}`;
+                events.push({ id: inboundEventId, time, type: "InboundArrival", vehicleId });
+                this.insertFutureOutbound({
+                    inboundEventId,
                     time: time + this.sampleParkingDurationSeconds(),
                     vehicleId,
                 });
             }
             const parkedVehicles = new Set(garageState.occupancy.occupied.map((vehicle) => vehicle.vehicleId));
-            for (let index = this.scheduledOutbounds.length - 1; index >= 0; index -= 1) {
-                const scheduled = this.scheduledOutbounds[index];
-                if (scheduled && scheduled.time <= time) {
-                    if (parkedVehicles.has(scheduled.vehicleId)) {
-                        events.push({
-                            id: `evt-${time}-out-${scheduled.vehicleId}`,
-                            time,
-                            type: "OutboundRequest",
-                            vehicleId: scheduled.vehicleId,
-                        });
-                    }
-                    this.scheduledOutbounds.splice(index, 1);
+            while (this.futureOutbounds[0]?.time !== undefined && this.futureOutbounds[0].time <= time) {
+                const scheduled = this.futureOutbounds.shift();
+                if (!scheduled)
+                    break;
+                if (this.canceledInboundEventIds.delete(scheduled.inboundEventId)) {
+                    continue;
+                }
+                this.dueOutbounds.set(scheduled.vehicleId, scheduled);
+            }
+            for (const [vehicleId] of this.dueOutbounds) {
+                if (parkedVehicles.has(vehicleId)) {
+                    events.push({
+                        id: `evt-${time}-out-${vehicleId}`,
+                        time,
+                        type: "OutboundRequest",
+                        vehicleId,
+                    });
+                    this.dueOutbounds.delete(vehicleId);
                 }
             }
             return events;
         }
+        recordIntakeResults(results) {
+            const rejectedInboundEventIds = new Set(results
+                .filter((result) => !result.accepted &&
+                (result.outcome === "Balked" || result.outcome === "RejectedGarageFull"))
+                .map((result) => result.eventId));
+            for (const result of results) {
+                if (!rejectedInboundEventIds.has(result.eventId))
+                    continue;
+                const removedFromDueQueue = this.dueOutbounds.delete(result.vehicleId);
+                if (!removedFromDueQueue) {
+                    this.canceledInboundEventIds.add(result.eventId);
+                }
+            }
+        }
+        insertFutureOutbound(outbound) {
+            let low = 0;
+            let high = this.futureOutbounds.length;
+            while (low < high) {
+                const middle = Math.floor((low + high) / 2);
+                const middleTime = this.futureOutbounds[middle]?.time ?? Number.POSITIVE_INFINITY;
+                if (middleTime <= outbound.time) {
+                    low = middle + 1;
+                }
+                else {
+                    high = middle;
+                }
+            }
+            this.futureOutbounds.splice(low, 0, outbound);
+        }
         inboundLambdaPerSecond(time) {
             const secondsInDay = 24 * 60 * 60;
-            const secondOfDay = time % secondsInDay;
+            const localElapsedSeconds = this.startLocalSecondOfDay + time;
+            const dayOffset = Math.floor(localElapsedSeconds / secondsInDay);
+            const secondOfDay = ((localElapsedSeconds % secondsInDay) + secondsInDay) % secondsInDay;
             const hour = secondOfDay / 3600;
-            const baseDaily = this.config.averageInboundPerDay;
+            const dailyMultiplier = this.isWeekend(dayOffset) ? this.config.weekendMultiplier : 1;
+            const baseDaily = this.config.averageInboundPerDay * dailyMultiplier;
             const peakStart = this.config.peakHour - this.config.peakWindowHours / 2;
             const peakEnd = this.config.peakHour + this.config.peakWindowHours / 2;
             const inPeak = hour >= peakStart && hour < peakEnd;
@@ -1313,6 +2385,32 @@ define("simulation/demand-generator", ["require", "exports", "simulation/random"
             }
             const offPeakSeconds = secondsInDay - this.config.peakWindowHours * 3600;
             return (baseDaily * (1 - this.config.peakShare)) / offPeakSeconds;
+        }
+        isWeekend(dayOffset) {
+            const cached = this.weekendByDayOffset.get(dayOffset);
+            if (cached !== undefined)
+                return cached;
+            const start = new Date(this.runtime.startTime);
+            const localMiddayMilliseconds = start.getTime() +
+                (dayOffset * 24 * 60 * 60 - this.startLocalSecondOfDay + 12 * 60 * 60) * 1000;
+            const weekday = new Intl.DateTimeFormat("en-US", {
+                timeZone: this.runtime.timezone,
+                weekday: "short",
+            }).format(new Date(localMiddayMilliseconds));
+            const weekend = weekday === "Sat" || weekday === "Sun";
+            this.weekendByDayOffset.set(dayOffset, weekend);
+            return weekend;
+        }
+        getStartLocalSecondOfDay() {
+            const parts = new Intl.DateTimeFormat("en-US", {
+                timeZone: this.runtime.timezone,
+                hour: "2-digit",
+                minute: "2-digit",
+                second: "2-digit",
+                hourCycle: "h23",
+            }).formatToParts(new Date(this.runtime.startTime));
+            const value = (type) => Number(parts.find((part) => part.type === type)?.value ?? 0);
+            return value("hour") * 3600 + value("minute") * 60 + value("second");
         }
         samplePoisson(lambda) {
             if (lambda <= 0)
@@ -1352,7 +2450,7 @@ define("simulation/session-factory", ["require", "exports", "garage/simple-garag
         const strategies = (0, strategy_registry_js_2.createGarageStrategies)(config.garage.strategies);
         const garage = new SimpleGarageFactory().createGarage(config.garage, strategies);
         const demandGenerator = new demand_generator_js_1.SeededDemandGenerator();
-        demandGenerator.initialize(config.demand, config.simulation.seed);
+        demandGenerator.initialize(config.demand, config.simulation, config.simulation.seed);
         return {
             id: `${config.simulation.sessionName}-${config.simulation.seed}`,
             config,
@@ -1420,6 +2518,7 @@ define("simulation/simulation-engine", ["require", "exports", "simulation/teleme
                 events: generatedEvents,
                 rng: session.intakeRandomSource,
             });
+            session.demandGenerator.recordIntakeResults(intakeResults);
             const telemetry = new telemetry_js_1.BufferedGarageTelemetrySink();
             const context = {
                 time,
@@ -1515,9 +2614,9 @@ define("browser/app", ["require", "exports", "config/validate-config", "garage/s
             strategies: {
                 placement: { type: "lowest-access-cost" },
                 retrieval: { type: "simple-retrieval" },
-                tripPlanner: { type: "single-operation" },
+                tripPlanner: { type: "baseline-physical" },
                 preparationPositions: { type: "fixed-assignment" },
-                unblocking: { type: "disabled" },
+                unblocking: { type: "idle-after-10-minutes" },
             },
         },
     };
@@ -1665,7 +2764,7 @@ define("browser/app", ["require", "exports", "config/validate-config", "garage/s
         const finalSnapshot = run.result.finalSnapshot;
         setText("metric-activities", String(summary.successfulActivities));
         setText("metric-occupancy", `${finalSnapshot.occupancy.occupiedCount}/${finalSnapshot.occupancy.totalParkingCells}`);
-        setText("metric-inbound-wait", `${Math.round(summary.averageInboundWaitSeconds)}s`);
+        setText("metric-inbound-wait", `${Math.round(summary.averageInboundDriverWaitingSeconds)}s`);
         setText("metric-outbound-wait", `${Math.round(summary.averageOutboundWaitSeconds)}s`);
         setText("metric-revenue", String(summary.totalRevenue));
         setText("metric-raw-size", `${Math.round(run.rawJsonl.length / 1024)} KB`);

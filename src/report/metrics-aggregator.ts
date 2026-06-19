@@ -20,8 +20,10 @@ interface DailyAccumulator {
   dayOfWeek: string;
   successfulActivities: number;
   vehiclesStayingUntilMidnight: number;
+  inboundDriverWaitingSeconds: number[];
   inboundWaitSeconds: number[];
   outboundWaitSeconds: number[];
+  morningPeakInboundDriverWaitingSeconds: number[];
   morningPeakInboundWaitSeconds: number[];
   eveningPeakOutboundWaitSeconds: number[];
   biggestInboundQueueLength: number;
@@ -94,10 +96,19 @@ export class DailyMetricsAggregator implements MetricsAggregator {
         dayOfWeek: day.dayOfWeek,
         successfulActivities: day.successfulActivities,
         vehiclesStayingUntilMidnight: day.vehiclesStayingUntilMidnight,
+        averageInboundDriverWaitingSeconds: average(
+          day.inboundDriverWaitingSeconds,
+        ),
         averageInboundWaitSeconds: average(day.inboundWaitSeconds),
         averageOutboundWaitSeconds: average(day.outboundWaitSeconds),
+        averageInboundDriverWaitingSecondsDuringMorningPeak: average(
+          day.morningPeakInboundDriverWaitingSeconds,
+        ),
         averageInboundWaitSecondsDuringMorningPeak: average(day.morningPeakInboundWaitSeconds),
         averageOutboundWaitSecondsDuringEveningPeak: average(day.eveningPeakOutboundWaitSeconds),
+        longestInboundDriverWaitingSeconds: max(
+          day.inboundDriverWaitingSeconds,
+        ),
         longestInboundWaitSeconds: max(day.inboundWaitSeconds),
         longestOutboundWaitSeconds: max(day.outboundWaitSeconds),
         biggestInboundQueueLength: day.biggestInboundQueueLength,
@@ -140,6 +151,17 @@ export class DailyMetricsAggregator implements MetricsAggregator {
   private captureCompletedOperations(time: SimTime, operations: GarageCompletedOperation[], day: DailyAccumulator): void {
     for (const operation of operations) {
       if (!operation.vehicleId) continue;
+
+      if (operation.type === "EnterInboundPreparationPosition") {
+        const arrivalTime = this.inboundEventTimeByVehicle.get(operation.vehicleId);
+        if (arrivalTime !== undefined) {
+          const waitSeconds = time - arrivalTime;
+          day.inboundDriverWaitingSeconds.push(waitSeconds);
+          if (this.isHourWindow(arrivalTime, 8, 10)) {
+            day.morningPeakInboundDriverWaitingSeconds.push(waitSeconds);
+          }
+        }
+      }
 
       if (operation.type === "ParkInbound") {
         day.successfulActivities += 1;
@@ -250,8 +272,10 @@ export class DailyMetricsAggregator implements MetricsAggregator {
       dayOfWeek: this.formatDatePart(time, "weekday"),
       successfulActivities: 0,
       vehiclesStayingUntilMidnight: 0,
+      inboundDriverWaitingSeconds: [],
       inboundWaitSeconds: [],
       outboundWaitSeconds: [],
+      morningPeakInboundDriverWaitingSeconds: [],
       morningPeakInboundWaitSeconds: [],
       eveningPeakOutboundWaitSeconds: [],
       biggestInboundQueueLength: 0,

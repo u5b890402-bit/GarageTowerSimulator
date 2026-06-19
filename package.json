@@ -6,6 +6,7 @@
     "simulate": "npm run build && node dist/run-simulation.js",
     "report": "npm run build && node dist/run-report.js",
     "test:integration": "npm run build && node dist/run-simulation.js config/example-3x3.json && node dist/run-report.js output/example-3x3-baseline.jsonl output/example-3x3-report.json",
+    "test:physical": "npm run build && node dist/test-physical.js",
     "test:browser-build": "npm run build:browser"
   },
   "devDependencies": {

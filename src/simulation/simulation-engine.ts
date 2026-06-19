@@ -41,6 +41,7 @@ export class SimulationEngine {
       events: generatedEvents,
       rng: session.intakeRandomSource,
     });
+    session.demandGenerator.recordIntakeResults(intakeResults);
 
     const telemetry = new BufferedGarageTelemetrySink();
     const context: GarageTickContext = {
