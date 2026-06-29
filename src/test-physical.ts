@@ -83,6 +83,7 @@ let sawExplicitCellPath = false;
 
 verifyPathPlanner();
 verifyInboundDriverWaitingMetric();
+verifyFailedIdleUnblockingCache();
 
 submit(
   Array.from({ length: 5 }, (_, index) => ({
@@ -375,6 +376,52 @@ function verifyInboundDriverWaitingMetric(): void {
   assert(
     day.averageInboundWaitSeconds === 90,
     "End-to-end inbound processing time should remain available separately.",
+  );
+}
+
+function verifyFailedIdleUnblockingCache(): void {
+  const cacheGarage = new SimpleGarageTowerSystem(
+    createGarageStrategies(garageConfig.strategies),
+  );
+  cacheGarage.initialize(garageConfig);
+
+  const cacheRuntime: SimulationRuntimeConfig = {
+    ...runtime,
+    diagnostics: {
+      enabled: true,
+      planningSampleIntervalSeconds: 1,
+    },
+  };
+
+  const firstTelemetry = new BufferedGarageTelemetrySink();
+  cacheGarage.updateOneSecond({
+    time: 600,
+    deltaSeconds: 1,
+    simulation: cacheRuntime,
+    rng: new SeededRandomSource(101),
+    telemetry: firstTelemetry,
+  });
+
+  const secondTelemetry = new BufferedGarageTelemetrySink();
+  cacheGarage.updateOneSecond({
+    time: 601,
+    deltaSeconds: 1,
+    simulation: cacheRuntime,
+    rng: new SeededRandomSource(102),
+    telemetry: secondTelemetry,
+  });
+
+  let cacheHits = 0;
+  for (const record of secondTelemetry.flush()) {
+    if (record.kind !== "warning") continue;
+    if (record.value.message !== "PlanningDiagnostics") continue;
+    const value = record.value.detail?.["failedIdleUnblockCacheHits"];
+    cacheHits += typeof value === "number" ? value : 0;
+  }
+
+  assert(
+    cacheHits >= 1,
+    "Repeated failed idle-unblocking planning should be served from cache.",
   );
 }
 

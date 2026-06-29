@@ -13,6 +13,12 @@ export function validateSimulationConfig(config: SimulationConfig): ValidationRe
     if (config.simulation.tickSeconds <= 0) errors.push("simulation.tickSeconds must be positive.");
     if (!config.simulation.outputDir) errors.push("simulation.outputDir is required.");
     if (!config.simulation.rawOutputFile) errors.push("simulation.rawOutputFile is required.");
+    if (
+      config.simulation.diagnostics?.planningSampleIntervalSeconds !== undefined &&
+      config.simulation.diagnostics.planningSampleIntervalSeconds <= 0
+    ) {
+      errors.push("simulation.diagnostics.planningSampleIntervalSeconds must be positive.");
+    }
   }
 
   if (config.garage) {

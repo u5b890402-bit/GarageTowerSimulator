@@ -780,6 +780,10 @@ define("config/validate-config", ["require", "exports", "garage/strategy-registr
                 errors.push("simulation.outputDir is required.");
             if (!config.simulation.rawOutputFile)
                 errors.push("simulation.rawOutputFile is required.");
+            if (config.simulation.diagnostics?.planningSampleIntervalSeconds !== undefined &&
+                config.simulation.diagnostics.planningSampleIntervalSeconds <= 0) {
+                errors.push("simulation.diagnostics.planningSampleIntervalSeconds must be positive.");
+            }
         }
         if (config.garage) {
             const { layout, elevator, preparationPositions } = config.garage;
@@ -1573,6 +1577,8 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
     exports.SimpleGarageTowerSystem = void 0;
+    const failedIdleUnblockingCacheMaxEntries = 512;
+    const failedIdleUnblockingCacheTtlSeconds = 600;
     class SimpleGarageTowerSystem {
         constructor(strategies) {
             this.strategies = strategies;
@@ -1587,6 +1593,8 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
             this.elevatorFloor = 1;
             this.elevatorDirection = "stopped";
             this.lastExternalActivityAt = 0;
+            this.planningDiagnostics = null;
+            this.failedIdleUnblockingCache = new Map();
             this.counters = this.newCounters();
         }
         initialize(config) {
@@ -1601,6 +1609,8 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
             this.elevatorFloor = 1;
             this.elevatorDirection = "stopped";
             this.lastExternalActivityAt = 0;
+            this.planningDiagnostics = null;
+            this.failedIdleUnblockingCache.clear();
             this.counters = this.newCounters();
             this.preparationPositions = [
                 ...Array.from({ length: config.preparationPositions.inboundCount }, (_, index) => ({
@@ -1781,11 +1791,33 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
             const snapshot = this.getSnapshot();
             snapshot.time = context.time;
             const idleSeconds = context.time - this.lastExternalActivityAt;
-            const idleUnblockingAllowed = this.strategies.unblockingStrategy.shouldStartIdleUnblocking({
-                time: context.time,
-                snapshot,
-                idleSeconds,
-            });
+            const garageIsFull = snapshot.occupancy.occupiedCount >= snapshot.occupancy.totalParkingCells;
+            const idleUnblockingAllowed = !garageIsFull &&
+                this.strategies.unblockingStrategy.shouldStartIdleUnblocking({
+                    time: context.time,
+                    snapshot,
+                    idleSeconds,
+                });
+            const diagnosticsEnabled = context.simulation.diagnostics?.enabled === true;
+            const planningStartedAtMs = diagnosticsEnabled ? nowMs() : 0;
+            const idleUnblockingCandidate = idleUnblockingAllowed && this.isIdleUnblockingPlanningCandidate(snapshot);
+            const idleUnblockingCacheKey = idleUnblockingCandidate
+                ? this.failedIdleUnblockingCacheKey(snapshot)
+                : null;
+            if (idleUnblockingCacheKey &&
+                this.hasFailedIdleUnblockingCacheHit(idleUnblockingCacheKey, context.time)) {
+                if (diagnosticsEnabled) {
+                    this.recordPlanningDiagnostics({
+                        context,
+                        snapshot,
+                        idleUnblockingAllowed,
+                        elapsedMs: nowMs() - planningStartedAtMs,
+                        planned: false,
+                        failedIdleUnblockCacheHit: true,
+                    });
+                }
+                return null;
+            }
             const plan = this.strategies.tripPlanner.planNextTrip({
                 time: context.time,
                 snapshot,
@@ -1796,6 +1828,24 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
                 idleSeconds,
                 idleUnblockingAllowed,
             });
+            if (diagnosticsEnabled) {
+                this.recordPlanningDiagnostics({
+                    context,
+                    snapshot,
+                    idleUnblockingAllowed,
+                    elapsedMs: nowMs() - planningStartedAtMs,
+                    planned: Boolean(plan),
+                    failedIdleUnblockCacheHit: false,
+                });
+            }
+            if (idleUnblockingCacheKey) {
+                if (plan) {
+                    this.failedIdleUnblockingCache.delete(idleUnblockingCacheKey);
+                }
+                else {
+                    this.rememberFailedIdleUnblockingPlan(idleUnblockingCacheKey, context.time);
+                }
+            }
             if (!plan)
                 return null;
             const selectedOutboundIds = new Set(plan.selectedOutboundVehicleIds);
@@ -1818,6 +1868,119 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
                 groupIndex: 0,
                 activeGroup: null,
             };
+        }
+        recordPlanningDiagnostics(params) {
+            const { context, snapshot, idleUnblockingAllowed, elapsedMs, planned, failedIdleUnblockCacheHit, } = params;
+            const interval = Math.max(1, context.simulation.diagnostics?.planningSampleIntervalSeconds ?? 60);
+            const occupancy = snapshot.occupancy.occupiedCount;
+            const totalCells = snapshot.occupancy.totalParkingCells;
+            if (!this.planningDiagnostics) {
+                this.planningDiagnostics = this.newPlanningDiagnosticWindow(context.time);
+            }
+            const window = this.planningDiagnostics;
+            window.attempts += 1;
+            window.totalElapsedMs += elapsedMs;
+            window.maxElapsedMs = Math.max(window.maxElapsedMs, elapsedMs);
+            window.maxOccupancy = Math.max(window.maxOccupancy, occupancy);
+            window.maxInboundQueueLength = Math.max(window.maxInboundQueueLength, snapshot.queues.inboundLength);
+            window.maxOutboundQueueLength = Math.max(window.maxOutboundQueueLength, snapshot.queues.outboundLength);
+            if (planned) {
+                window.planCount += 1;
+            }
+            else {
+                window.noPlanCount += 1;
+            }
+            if (idleUnblockingAllowed) {
+                window.idleAllowedAttempts += 1;
+                if (!planned) {
+                    window.idleNoPlanAttempts += 1;
+                }
+            }
+            if (failedIdleUnblockCacheHit) {
+                window.failedIdleUnblockCacheHits += 1;
+            }
+            if (occupancy >= totalCells) {
+                window.fullOccupancyAttempts += 1;
+            }
+            if (context.time - window.startedAt < interval)
+                return;
+            context.telemetry.recordWarning({
+                time: context.time,
+                message: "PlanningDiagnostics",
+                detail: {
+                    windowStart: window.startedAt,
+                    windowEnd: context.time,
+                    attempts: window.attempts,
+                    planCount: window.planCount,
+                    noPlanCount: window.noPlanCount,
+                    idleAllowedAttempts: window.idleAllowedAttempts,
+                    idleNoPlanAttempts: window.idleNoPlanAttempts,
+                    failedIdleUnblockCacheHits: window.failedIdleUnblockCacheHits,
+                    fullOccupancyAttempts: window.fullOccupancyAttempts,
+                    avgElapsedMs: roundMilliseconds(window.totalElapsedMs / window.attempts),
+                    maxElapsedMs: roundMilliseconds(window.maxElapsedMs),
+                    maxOccupancy: window.maxOccupancy,
+                    totalParkingCells: totalCells,
+                    maxInboundQueueLength: window.maxInboundQueueLength,
+                    maxOutboundQueueLength: window.maxOutboundQueueLength,
+                },
+            });
+            this.planningDiagnostics = this.newPlanningDiagnosticWindow(context.time);
+        }
+        newPlanningDiagnosticWindow(startedAt) {
+            return {
+                startedAt,
+                attempts: 0,
+                planCount: 0,
+                noPlanCount: 0,
+                idleAllowedAttempts: 0,
+                idleNoPlanAttempts: 0,
+                failedIdleUnblockCacheHits: 0,
+                fullOccupancyAttempts: 0,
+                totalElapsedMs: 0,
+                maxElapsedMs: 0,
+                maxOccupancy: 0,
+                maxInboundQueueLength: 0,
+                maxOutboundQueueLength: 0,
+            };
+        }
+        isIdleUnblockingPlanningCandidate(snapshot) {
+            return (snapshot.queues.inboundLength === 0 &&
+                snapshot.queues.outboundLength === 0 &&
+                !snapshot.preparationPositions.some((position) => position.occupiedBy));
+        }
+        failedIdleUnblockingCacheKey(snapshot) {
+            const occupiedCellIds = snapshot.occupancy.occupied
+                .map((cell) => cell.cellId)
+                .sort()
+                .join(",");
+            return `${snapshot.elevator.currentFloor}|${occupiedCellIds}`;
+        }
+        hasFailedIdleUnblockingCacheHit(key, time) {
+            const cached = this.failedIdleUnblockingCache.get(key);
+            if (!cached)
+                return false;
+            if (cached.expiresAt <= time) {
+                this.failedIdleUnblockingCache.delete(key);
+                return false;
+            }
+            this.failedIdleUnblockingCache.delete(key);
+            this.failedIdleUnblockingCache.set(key, cached);
+            return true;
+        }
+        rememberFailedIdleUnblockingPlan(key, time) {
+            this.failedIdleUnblockingCache.set(key, {
+                expiresAt: time + failedIdleUnblockingCacheTtlSeconds,
+            });
+            this.trimFailedIdleUnblockingCache();
+        }
+        trimFailedIdleUnblockingCache() {
+            while (this.failedIdleUnblockingCache.size > failedIdleUnblockingCacheMaxEntries) {
+                const oldestKey = this.failedIdleUnblockingCache.keys().next().value;
+                if (!oldestKey)
+                    return;
+                this.failedIdleUnblockingCache.delete(oldestKey);
+            }
         }
         startNextGroup(context) {
             if (!this.trip)
@@ -2253,6 +2416,12 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
         }
     }
     exports.SimpleGarageTowerSystem = SimpleGarageTowerSystem;
+    function nowMs() {
+        return globalThis.performance?.now() ?? Date.now();
+    }
+    function roundMilliseconds(value) {
+        return Math.round(value * 1000) / 1000;
+    }
 });
 define("simulation/random", ["require", "exports"], function (require, exports) {
     "use strict";
@@ -2530,6 +2699,8 @@ define("simulation/simulation-engine", ["require", "exports", "simulation/teleme
             const tickResult = session.garage.updateOneSecond(context);
             const afterSnapshot = session.garage.getSnapshot();
             afterSnapshot.time = time;
+            const telemetryRecords = telemetry.flush();
+            this.logDiagnostics(session, telemetryRecords);
             const record = {
                 sessionId: session.id,
                 time,
@@ -2538,10 +2709,26 @@ define("simulation/simulation-engine", ["require", "exports", "simulation/teleme
                 tickResult,
                 beforeSnapshot,
                 afterSnapshot,
-                telemetry: telemetry.flush(),
+                telemetry: telemetryRecords,
             };
             await session.recorder.recordSecond(record);
             return { record };
+        }
+        logDiagnostics(session, telemetryRecords) {
+            const diagnostics = session.config.simulation.diagnostics;
+            if (diagnostics?.enabled !== true || diagnostics.console !== true)
+                return;
+            for (const record of telemetryRecords) {
+                if (record.kind !== "warning")
+                    continue;
+                if (record.value.message !== "PlanningDiagnostics")
+                    continue;
+                const detail = record.value.detail ?? {};
+                console.info("[parking-sim][diagnostics]", {
+                    time: record.value.time,
+                    ...detail,
+                });
+            }
         }
     }
     exports.SimulationEngine = SimulationEngine;
@@ -2570,6 +2757,11 @@ define("browser/app", ["require", "exports", "config/validate-config", "garage/s
                 probabilityStep: 0.1,
                 certainAtQueueLength: 18,
             },
+            "diagnostics": {
+                "enabled": true,
+                "console": false,
+                "planningSampleIntervalSeconds": 60
+            }
         },
         demand: {
             averageInboundPerDay: 1200,

@@ -208,6 +208,24 @@ Demand generation applies `weekendMultiplier` to the expected inbound total on S
 
 Each accepted inbound arrival is assigned a scheduled outbound time. If that time arrives before the vehicle has reached a parking cell, the outbound request remains pending and is emitted as soon as the vehicle is parked. Scheduled outbound requests are canceled when the corresponding inbound arrival balks or is rejected because the garage is full.
 
+### Diagnostics
+
+Planning diagnostics can be enabled from the same configuration file in both runtimes:
+
+```json
+{
+  "simulation": {
+    "diagnostics": {
+      "enabled": true,
+      "console": true,
+      "planningSampleIntervalSeconds": 60
+    }
+  }
+}
+```
+
+When enabled, the simulator writes `PlanningDiagnostics` telemetry into the raw JSONL output. With `console: true`, the same summaries are also printed to the Node terminal or the browser developer console. The diagnostics summarize trip-planning attempts, no-plan attempts, idle-unblocking attempts, failed idle-unblock cache hits, full-occupancy attempts, and average/max planning time for each sampling window.
+
 ### Strategy Selection
 
 Garage strategy implementations are selected with stable IDs under `garage.strategies`:

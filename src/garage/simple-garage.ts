@@ -47,6 +47,29 @@ interface PhysicalTrip {
   activeGroup: ActiveActionGroup | null;
 }
 
+interface PlanningDiagnosticWindow {
+  startedAt: SimTime;
+  attempts: number;
+  planCount: number;
+  noPlanCount: number;
+  idleAllowedAttempts: number;
+  idleNoPlanAttempts: number;
+  failedIdleUnblockCacheHits: number;
+  fullOccupancyAttempts: number;
+  totalElapsedMs: number;
+  maxElapsedMs: number;
+  maxOccupancy: number;
+  maxInboundQueueLength: number;
+  maxOutboundQueueLength: number;
+}
+
+interface FailedIdleUnblockingCacheEntry {
+  expiresAt: SimTime;
+}
+
+const failedIdleUnblockingCacheMaxEntries = 512;
+const failedIdleUnblockingCacheTtlSeconds = 600;
+
 export class SimpleGarageTowerSystem implements GarageTowerSystem {
   private layout!: GridGarageLayout;
   private pathPlanner!: GridVmrPathPlanner;
@@ -62,6 +85,11 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
   private elevatorFloor = 1;
   private elevatorDirection: "up" | "down" | "stopped" = "stopped";
   private lastExternalActivityAt = 0;
+  private planningDiagnostics: PlanningDiagnosticWindow | null = null;
+  private readonly failedIdleUnblockingCache = new Map<
+    string,
+    FailedIdleUnblockingCacheEntry
+  >();
   private counters: GarageCumulativeCounters = this.newCounters();
 
   constructor(private readonly strategies: GarageStrategySet) {}
@@ -78,6 +106,8 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
     this.elevatorFloor = 1;
     this.elevatorDirection = "stopped";
     this.lastExternalActivityAt = 0;
+    this.planningDiagnostics = null;
+    this.failedIdleUnblockingCache.clear();
     this.counters = this.newCounters();
     this.preparationPositions = [
       ...Array.from({ length: config.preparationPositions.inboundCount }, (_, index) => ({
@@ -288,12 +318,40 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
     const snapshot = this.getSnapshot();
     snapshot.time = context.time;
     const idleSeconds = context.time - this.lastExternalActivityAt;
+    const garageIsFull =
+      snapshot.occupancy.occupiedCount >= snapshot.occupancy.totalParkingCells;
     const idleUnblockingAllowed =
+      !garageIsFull &&
       this.strategies.unblockingStrategy.shouldStartIdleUnblocking({
         time: context.time,
         snapshot,
         idleSeconds,
       });
+    const diagnosticsEnabled = context.simulation.diagnostics?.enabled === true;
+    const planningStartedAtMs = diagnosticsEnabled ? nowMs() : 0;
+    const idleUnblockingCandidate =
+      idleUnblockingAllowed && this.isIdleUnblockingPlanningCandidate(snapshot);
+    const idleUnblockingCacheKey = idleUnblockingCandidate
+      ? this.failedIdleUnblockingCacheKey(snapshot)
+      : null;
+
+    if (
+      idleUnblockingCacheKey &&
+      this.hasFailedIdleUnblockingCacheHit(idleUnblockingCacheKey, context.time)
+    ) {
+      if (diagnosticsEnabled) {
+        this.recordPlanningDiagnostics({
+          context,
+          snapshot,
+          idleUnblockingAllowed,
+          elapsedMs: nowMs() - planningStartedAtMs,
+          planned: false,
+          failedIdleUnblockCacheHit: true,
+        });
+      }
+      return null;
+    }
+
     const plan = this.strategies.tripPlanner.planNextTrip({
       time: context.time,
       snapshot,
@@ -304,6 +362,26 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
       idleSeconds,
       idleUnblockingAllowed,
     });
+    if (diagnosticsEnabled) {
+      this.recordPlanningDiagnostics({
+        context,
+        snapshot,
+        idleUnblockingAllowed,
+        elapsedMs: nowMs() - planningStartedAtMs,
+        planned: Boolean(plan),
+        failedIdleUnblockCacheHit: false,
+      });
+    }
+    if (idleUnblockingCacheKey) {
+      if (plan) {
+        this.failedIdleUnblockingCache.delete(idleUnblockingCacheKey);
+      } else {
+        this.rememberFailedIdleUnblockingPlan(
+          idleUnblockingCacheKey,
+          context.time,
+        );
+      }
+    }
     if (!plan) return null;
 
     const selectedOutboundIds = new Set(plan.selectedOutboundVehicleIds);
@@ -328,6 +406,158 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
       groupIndex: 0,
       activeGroup: null,
     };
+  }
+
+  private recordPlanningDiagnostics(params: {
+    context: GarageTickContext;
+    snapshot: GarageStateSnapshot;
+    idleUnblockingAllowed: boolean;
+    elapsedMs: number;
+    planned: boolean;
+    failedIdleUnblockCacheHit: boolean;
+  }): void {
+    const {
+      context,
+      snapshot,
+      idleUnblockingAllowed,
+      elapsedMs,
+      planned,
+      failedIdleUnblockCacheHit,
+    } = params;
+    const interval = Math.max(
+      1,
+      context.simulation.diagnostics?.planningSampleIntervalSeconds ?? 60,
+    );
+    const occupancy = snapshot.occupancy.occupiedCount;
+    const totalCells = snapshot.occupancy.totalParkingCells;
+
+    if (!this.planningDiagnostics) {
+      this.planningDiagnostics = this.newPlanningDiagnosticWindow(context.time);
+    }
+
+    const window = this.planningDiagnostics;
+    window.attempts += 1;
+    window.totalElapsedMs += elapsedMs;
+    window.maxElapsedMs = Math.max(window.maxElapsedMs, elapsedMs);
+    window.maxOccupancy = Math.max(window.maxOccupancy, occupancy);
+    window.maxInboundQueueLength = Math.max(
+      window.maxInboundQueueLength,
+      snapshot.queues.inboundLength,
+    );
+    window.maxOutboundQueueLength = Math.max(
+      window.maxOutboundQueueLength,
+      snapshot.queues.outboundLength,
+    );
+
+    if (planned) {
+      window.planCount += 1;
+    } else {
+      window.noPlanCount += 1;
+    }
+    if (idleUnblockingAllowed) {
+      window.idleAllowedAttempts += 1;
+      if (!planned) {
+        window.idleNoPlanAttempts += 1;
+      }
+    }
+    if (failedIdleUnblockCacheHit) {
+      window.failedIdleUnblockCacheHits += 1;
+    }
+    if (occupancy >= totalCells) {
+      window.fullOccupancyAttempts += 1;
+    }
+
+    if (context.time - window.startedAt < interval) return;
+
+    context.telemetry.recordWarning({
+      time: context.time,
+      message: "PlanningDiagnostics",
+      detail: {
+        windowStart: window.startedAt,
+        windowEnd: context.time,
+        attempts: window.attempts,
+        planCount: window.planCount,
+        noPlanCount: window.noPlanCount,
+        idleAllowedAttempts: window.idleAllowedAttempts,
+        idleNoPlanAttempts: window.idleNoPlanAttempts,
+        failedIdleUnblockCacheHits: window.failedIdleUnblockCacheHits,
+        fullOccupancyAttempts: window.fullOccupancyAttempts,
+        avgElapsedMs: roundMilliseconds(window.totalElapsedMs / window.attempts),
+        maxElapsedMs: roundMilliseconds(window.maxElapsedMs),
+        maxOccupancy: window.maxOccupancy,
+        totalParkingCells: totalCells,
+        maxInboundQueueLength: window.maxInboundQueueLength,
+        maxOutboundQueueLength: window.maxOutboundQueueLength,
+      },
+    });
+    this.planningDiagnostics = this.newPlanningDiagnosticWindow(context.time);
+  }
+
+  private newPlanningDiagnosticWindow(startedAt: SimTime): PlanningDiagnosticWindow {
+    return {
+      startedAt,
+      attempts: 0,
+      planCount: 0,
+      noPlanCount: 0,
+      idleAllowedAttempts: 0,
+      idleNoPlanAttempts: 0,
+      failedIdleUnblockCacheHits: 0,
+      fullOccupancyAttempts: 0,
+      totalElapsedMs: 0,
+      maxElapsedMs: 0,
+      maxOccupancy: 0,
+      maxInboundQueueLength: 0,
+      maxOutboundQueueLength: 0,
+    };
+  }
+
+  private isIdleUnblockingPlanningCandidate(snapshot: GarageStateSnapshot): boolean {
+    return (
+      snapshot.queues.inboundLength === 0 &&
+      snapshot.queues.outboundLength === 0 &&
+      !snapshot.preparationPositions.some((position) => position.occupiedBy)
+    );
+  }
+
+  private failedIdleUnblockingCacheKey(snapshot: GarageStateSnapshot): string {
+    const occupiedCellIds = snapshot.occupancy.occupied
+      .map((cell) => cell.cellId)
+      .sort()
+      .join(",");
+    return `${snapshot.elevator.currentFloor}|${occupiedCellIds}`;
+  }
+
+  private hasFailedIdleUnblockingCacheHit(
+    key: string,
+    time: SimTime,
+  ): boolean {
+    const cached = this.failedIdleUnblockingCache.get(key);
+    if (!cached) return false;
+    if (cached.expiresAt <= time) {
+      this.failedIdleUnblockingCache.delete(key);
+      return false;
+    }
+
+    this.failedIdleUnblockingCache.delete(key);
+    this.failedIdleUnblockingCache.set(key, cached);
+    return true;
+  }
+
+  private rememberFailedIdleUnblockingPlan(key: string, time: SimTime): void {
+    this.failedIdleUnblockingCache.set(key, {
+      expiresAt: time + failedIdleUnblockingCacheTtlSeconds,
+    });
+    this.trimFailedIdleUnblockingCache();
+  }
+
+  private trimFailedIdleUnblockingCache(): void {
+    while (
+      this.failedIdleUnblockingCache.size > failedIdleUnblockingCacheMaxEntries
+    ) {
+      const oldestKey = this.failedIdleUnblockingCache.keys().next().value;
+      if (!oldestKey) return;
+      this.failedIdleUnblockingCache.delete(oldestKey);
+    }
   }
 
   private startNextGroup(context: GarageTickContext): GarageOperation[] {
@@ -819,4 +1049,12 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
       downwardTripPlacements: 0,
     };
   }
+}
+
+function nowMs(): number {
+  return globalThis.performance?.now() ?? Date.now();
+}
+
+function roundMilliseconds(value: number): number {
+  return Math.round(value * 1000) / 1000;
 }

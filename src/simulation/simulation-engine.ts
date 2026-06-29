@@ -1,4 +1,5 @@
 import type {
+  GarageTelemetryRecord,
   GarageTickContext,
   SimulationResult,
   SimulationSecondRecord,
@@ -55,6 +56,8 @@ export class SimulationEngine {
     const tickResult = session.garage.updateOneSecond(context);
     const afterSnapshot = session.garage.getSnapshot();
     afterSnapshot.time = time;
+    const telemetryRecords = telemetry.flush();
+    this.logDiagnostics(session, telemetryRecords);
 
     const record: SimulationSecondRecord = {
       sessionId: session.id,
@@ -64,10 +67,28 @@ export class SimulationEngine {
       tickResult,
       beforeSnapshot,
       afterSnapshot,
-      telemetry: telemetry.flush(),
+      telemetry: telemetryRecords,
     };
 
     await session.recorder.recordSecond(record);
     return { record };
+  }
+
+  private logDiagnostics(
+    session: SimulationSession,
+    telemetryRecords: GarageTelemetryRecord[],
+  ): void {
+    const diagnostics = session.config.simulation.diagnostics;
+    if (diagnostics?.enabled !== true || diagnostics.console !== true) return;
+
+    for (const record of telemetryRecords) {
+      if (record.kind !== "warning") continue;
+      if (record.value.message !== "PlanningDiagnostics") continue;
+      const detail = record.value.detail ?? {};
+      console.info("[parking-sim][diagnostics]", {
+        time: record.value.time,
+        ...detail,
+      });
+    }
   }
 }

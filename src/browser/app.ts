@@ -36,6 +36,11 @@ const exampleConfig: SimulationConfig = {
       probabilityStep: 0.1,
       certainAtQueueLength: 18,
     },
+    "diagnostics": {
+      "enabled": true,
+      "console": false,
+      "planningSampleIntervalSeconds": 60
+    }
   },
   demand: {
     averageInboundPerDay: 1200,

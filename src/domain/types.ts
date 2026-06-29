@@ -46,6 +46,13 @@ export interface SimulationRuntimeConfig {
   timezone: string;
   revenuePolicy: RevenuePolicyConfig;
   balkingPolicy: BalkingPolicyConfig;
+  diagnostics?: SimulationDiagnosticsConfig;
+}
+
+export interface SimulationDiagnosticsConfig {
+  enabled: boolean;
+  console?: boolean;
+  planningSampleIntervalSeconds?: number;
 }
 
 export interface DemandGenerationConfig {
