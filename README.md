@@ -54,6 +54,7 @@ npm run build:browser
 ```
 
 Then open [public/index.html](public/index.html) in a browser.
+The user-friendly configuration and report guide is available at [public/documentation.html](public/documentation.html).
 
 Run the example simulation:
 
@@ -127,6 +128,12 @@ Open:
 
 ```text
 public/index.html
+```
+
+The browser app also links to:
+
+```text
+public/documentation.html
 ```
 
 The browser app lets the user:

@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Parking Tower Simulator Documentation</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body class="docs-page">
+    <header class="docs-header">
+      <div>
+        <p class="eyebrow">Parking Tower Simulator</p>
+        <h1>Configuration and Report Guide</h1>
+        <p class="docs-lede">
+          Use this guide to edit a simulation configuration, run scenarios, and understand the report output.
+        </p>
+      </div>
+      <a class="button-link" href="./index.html">Open Simulator</a>
+    </header>
+
+    <main class="docs-layout">
+      <nav class="docs-nav" aria-label="Documentation sections">
+        <a href="#quick-start">Quick Start</a>
+        <a href="#configuration">Configuration</a>
+        <a href="#simulation">Simulation</a>
+        <a href="#demand">Demand</a>
+        <a href="#garage">Garage</a>
+        <a href="#strategies">Strategies</a>
+        <a href="#report">Report</a>
+        <a href="#tips">Scenario Tips</a>
+      </nav>
+
+      <article class="docs-content">
+        <section id="quick-start">
+          <h2>Quick Start</h2>
+          <ol class="step-list">
+            <li>Open the simulator and select <strong>Load Example</strong>.</li>
+            <li>Change the configuration JSON if you want to test a different scenario.</li>
+            <li>Select strategy choices from the dropdowns, or leave the defaults.</li>
+            <li>Select <strong>Run Simulation</strong>.</li>
+            <li>Review the summary, then download the full report or raw output if needed.</li>
+          </ol>
+          <p>
+            The browser app runs entirely inside the browser. The downloaded raw output is the detailed event log;
+            the downloaded report is the easier file to read first.
+          </p>
+        </section>
+
+        <section id="configuration">
+          <h2>Configuration</h2>
+          <p>
+            A configuration is a JSON document with three main sections: <code>simulation</code>,
+            <code>demand</code>, and <code>garage</code>. JSON is strict: keep quotation marks, commas, braces, and
+            square brackets exactly balanced.
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Section</th>
+                <th>Meaning</th>
+                <th>Common Changes</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>simulation</code></td>
+                <td>How long to run, when the scenario starts, how random results are seeded, and how billing works.</td>
+                <td>Run length, seed, revenue policy, diagnostics.</td>
+              </tr>
+              <tr>
+                <td><code>demand</code></td>
+                <td>How many vehicles arrive, when demand peaks, and how long vehicles stay.</td>
+                <td>Daily traffic, peak behavior, parking duration.</td>
+              </tr>
+              <tr>
+                <td><code>garage</code></td>
+                <td>The physical tower layout, elevator, VMRs, preparation positions, and strategy selections.</td>
+                <td>Deck count, tower size, speeds, strategy choices.</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="simulation">
+          <h2>Simulation Fields</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Field</th>
+                <th>Plain Meaning</th>
+                <th>How To Use It</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>sessionName</code></td>
+                <td>Name for this run.</td>
+                <td>Use a short scenario name, such as <code>3x3-long-stay</code>.</td>
+              </tr>
+              <tr>
+                <td><code>startTime</code></td>
+                <td>Calendar date and time when simulated time begins.</td>
+                <td>Use ISO-style text such as <code>2026-06-01T00:00:00-07:00</code>.</td>
+              </tr>
+              <tr>
+                <td><code>durationSeconds</code></td>
+                <td>Total simulated run length.</td>
+                <td>One day is <code>86400</code>; thirty days is <code>2592000</code>.</td>
+              </tr>
+              <tr>
+                <td><code>tickSeconds</code></td>
+                <td>How much simulated time each update step represents.</td>
+                <td>Keep this at <code>1</code> for the current physical model.</td>
+              </tr>
+              <tr>
+                <td><code>timezone</code></td>
+                <td>Timezone used for days, weekends, and peak windows.</td>
+                <td>Example: <code>America/Los_Angeles</code>.</td>
+              </tr>
+              <tr>
+                <td><code>seed</code></td>
+                <td>Controls repeatable randomness.</td>
+                <td>Same config plus same seed gives the same generated demand pattern.</td>
+              </tr>
+              <tr>
+                <td><code>outputDir</code>, <code>rawOutputFile</code></td>
+                <td>Where Node runs write raw output.</td>
+                <td>In the browser, downloads are handled by the browser instead.</td>
+              </tr>
+              <tr>
+                <td><code>revenuePolicy</code></td>
+                <td>How parking revenue is calculated.</td>
+                <td><code>chargePerBillingBlock</code> is charged every <code>billingBlockMinutes</code>.</td>
+              </tr>
+              <tr>
+                <td><code>balkingPolicy</code></td>
+                <td>How likely inbound drivers are to leave when the inbound queue is long.</td>
+                <td>Higher queue thresholds make drivers more patient.</td>
+              </tr>
+              <tr>
+                <td><code>diagnostics</code></td>
+                <td>Optional technical logging for investigating performance.</td>
+                <td>Usually off for normal users. Turn on when comparing planning performance.</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="demand">
+          <h2>Demand Fields</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Field</th>
+                <th>Plain Meaning</th>
+                <th>How It Affects Results</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>averageInboundPerDay</code></td>
+                <td>Expected number of inbound vehicles per weekday.</td>
+                <td>Higher values create more arrivals, longer queues, and more work for the garage.</td>
+              </tr>
+              <tr>
+                <td><code>weekendMultiplier</code></td>
+                <td>Multiplier applied on Saturdays and Sundays.</td>
+                <td><code>0.5</code> means weekend inbound demand is about half of weekday demand.</td>
+              </tr>
+              <tr>
+                <td><code>peakHour</code></td>
+                <td>Center of the inbound peak period.</td>
+                <td><code>9</code> means the morning peak is centered around 9 AM.</td>
+              </tr>
+              <tr>
+                <td><code>peakWindowHours</code></td>
+                <td>Width of the peak period.</td>
+                <td><code>2</code> means the peak spans about two hours.</td>
+              </tr>
+              <tr>
+                <td><code>peakShare</code></td>
+                <td>Fraction of daily inbound demand assigned to the peak window.</td>
+                <td><code>0.5</code> means about half of inbound vehicles arrive during the peak window.</td>
+              </tr>
+              <tr>
+                <td><code>parkingDuration</code></td>
+                <td>How long vehicles stay before requesting outbound retrieval.</td>
+                <td><code>minHours</code>, <code>maxHours</code>, and <code>modeHours</code> define a triangular distribution.</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="garage">
+          <h2>Garage Fields</h2>
+          <h3>Layout</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Field</th>
+                <th>Meaning</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>rows</code>, <code>columns</code>, <code>floors</code></td>
+                <td>Size of the parking grid and number of tower floors.</td>
+              </tr>
+              <tr>
+                <td><code>elevatorCell</code></td>
+                <td>Cell number occupied by the elevator shaft on every floor.</td>
+              </tr>
+              <tr>
+                <td><code>unavailableCells</code></td>
+                <td>Cell numbers that cannot be used for parking.</td>
+              </tr>
+              <tr>
+                <td><code>streetFacing</code></td>
+                <td>Whether the tower's long side or short side faces the street. This is recorded but not fully modeled yet.</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h3>Elevator, VMRs, and Preparation Positions</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Field</th>
+                <th>Meaning</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>elevator.deckCount</code></td>
+                <td>Number of elevator decks. Each deck has one VMR.</td>
+              </tr>
+              <tr>
+                <td><code>verticalSpeedMetersPerSecond</code></td>
+                <td>Elevator vertical movement speed.</td>
+              </tr>
+              <tr>
+                <td><code>floorHeightMeters</code></td>
+                <td>Vertical distance between floors.</td>
+              </tr>
+              <tr>
+                <td><code>deckRotationSeconds</code></td>
+                <td>Time for a deck to rotate between garage-facing and street-facing orientation.</td>
+              </tr>
+              <tr>
+                <td><code>vmr.speedMetersPerSecond</code></td>
+                <td>VMR movement speed inside the garage grid.</td>
+              </tr>
+              <tr>
+                <td><code>vmr.gripReleaseSeconds</code></td>
+                <td>Time to grip or release a vehicle.</td>
+              </tr>
+              <tr>
+                <td><code>preparationPositions.inboundCount</code></td>
+                <td>Number of inbound preparation positions where arriving drivers leave vehicles.</td>
+              </tr>
+              <tr>
+                <td><code>preparationPositions.outboundCount</code></td>
+                <td>Number of outbound preparation positions where drivers pick up vehicles.</td>
+              </tr>
+              <tr>
+                <td><code>kind</code></td>
+                <td><code>parallel</code> or <code>sequential</code> preparation-position clearing behavior.</td>
+              </tr>
+              <tr>
+                <td><code>mode</code></td>
+                <td><code>designated</code> keeps inbound/outbound assignments fixed. <code>dynamic</code> is reserved for future behavior.</td>
+              </tr>
+              <tr>
+                <td><code>doorSeconds</code></td>
+                <td>Time for preparation-position doors to open or close.</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="strategies">
+          <h2>Strategy Fields</h2>
+          <p>
+            Strategies select the implementation used by the garage. They let scenarios compare different garage
+            behavior while using the same demand pattern.
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Strategy</th>
+                <th>Available Value</th>
+                <th>Meaning</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>placement</code></td>
+                <td><code>lowest-access-cost</code></td>
+                <td>Chooses an empty cell estimated to be easiest to access.</td>
+              </tr>
+              <tr>
+                <td><code>placement</code></td>
+                <td><code>first-available</code></td>
+                <td>Chooses the first available cell in layout order.</td>
+              </tr>
+              <tr>
+                <td><code>retrieval</code></td>
+                <td><code>simple-retrieval</code></td>
+                <td>Baseline retrieval classification and cost estimate.</td>
+              </tr>
+              <tr>
+                <td><code>tripPlanner</code></td>
+                <td><code>baseline-physical</code></td>
+                <td>Builds timed physical trips with deck assignments, blocker moves, VMR paths, elevator stops, and PP transfers.</td>
+              </tr>
+              <tr>
+                <td><code>preparationPositions</code></td>
+                <td><code>fixed-assignment</code></td>
+                <td>Uses the configured inbound/outbound PP assignments.</td>
+              </tr>
+              <tr>
+                <td><code>unblocking</code></td>
+                <td><code>idle-after-10-minutes</code></td>
+                <td>Attempts blocker relocation after ten quiet minutes without inbound or outbound demand.</td>
+              </tr>
+              <tr>
+                <td><code>unblocking</code></td>
+                <td><code>disabled</code></td>
+                <td>Turns off idle unblocking.</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="report">
+          <h2>How To Interpret The Report</h2>
+          <p>
+            The report has daily rows plus a summary. For short simulations, the report may include a partial final day.
+            The <code>daily</code> array is best for day-by-day behavior; <code>thirtyDaySummary</code> is best for a quick comparison between scenarios.
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Report Field</th>
+                <th>Meaning</th>
+                <th>What To Watch</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>successfulActivities</code></td>
+                <td>Completed inbound parking plus completed outbound retrieval.</td>
+                <td>Higher is better when demand is comparable.</td>
+              </tr>
+              <tr>
+                <td><code>vehiclesStayingUntilMidnight</code></td>
+                <td>Vehicles still parked at the end of that calendar day.</td>
+                <td>Useful for understanding carry-over demand.</td>
+              </tr>
+              <tr>
+                <td><code>averageInboundDriverWaitingSeconds</code></td>
+                <td>Time from generated inbound arrival until the vehicle reaches an inbound PP.</td>
+                <td>This is the driver-facing inbound wait.</td>
+              </tr>
+              <tr>
+                <td><code>averageInboundWaitSeconds</code></td>
+                <td>Time from generated inbound arrival until the vehicle is placed into a parking cell.</td>
+                <td>This includes internal garage handling after the driver leaves.</td>
+              </tr>
+              <tr>
+                <td><code>averageOutboundWaitSeconds</code></td>
+                <td>Time from outbound request until the vehicle reaches an outbound PP.</td>
+                <td>This is the driver-facing outbound retrieval wait.</td>
+              </tr>
+              <tr>
+                <td><code>longest...WaitSeconds</code></td>
+                <td>Worst wait observed that day.</td>
+                <td>Use with averages; a good average can still hide a painful maximum.</td>
+              </tr>
+              <tr>
+                <td><code>biggestInboundQueueLength</code>, <code>biggestOutboundQueueLength</code></td>
+                <td>Largest queues seen during the day.</td>
+                <td>Queue spikes often explain long waits or balking.</td>
+              </tr>
+              <tr>
+                <td><code>inboundBalkingVehicles</code></td>
+                <td>Inbound drivers who gave up because the inbound queue was too long.</td>
+                <td>A high value means the system is not keeping up with inbound demand.</td>
+              </tr>
+              <tr>
+                <td><code>balkingOverSuccessfulInboundPercent</code></td>
+                <td>Balking count compared with successful inbound completions.</td>
+                <td>Can exceed 100% when more drivers balk than successfully park.</td>
+              </tr>
+              <tr>
+                <td><code>maximumOccupancyPercent</code></td>
+                <td>Highest parking-cell occupancy for the day.</td>
+                <td>Near 100% means capacity pressure and more blocked retrievals are likely.</td>
+              </tr>
+              <tr>
+                <td><code>elevatorTripsCarryingInducedInboundVehicles</code></td>
+                <td>Trips that had to carry blocker vehicles as induced inbound work.</td>
+                <td>Higher values indicate more blocked retrieval complexity.</td>
+              </tr>
+              <tr>
+                <td><code>totalInducedInboundVehicles</code></td>
+                <td>Total blocker vehicles moved as induced inbound work.</td>
+                <td>Useful for comparing placement strategies.</td>
+              </tr>
+              <tr>
+                <td><code>idleUnblockingActions</code>, <code>idleUnblockedVehicles</code></td>
+                <td>Idle maintenance moves performed after quiet periods.</td>
+                <td>Can reduce future retrieval pain, but also consumes mechanical work.</td>
+              </tr>
+              <tr>
+                <td><code>downwardTripPlacements</code></td>
+                <td>Inbound placements performed during downward trip phases.</td>
+                <td>Shows how often inbound work could not be completed on the upward phase.</td>
+              </tr>
+              <tr>
+                <td><code>totalParkingHours</code></td>
+                <td>Actual parked time in hours.</td>
+                <td>Operational usage, not necessarily billable time.</td>
+              </tr>
+              <tr>
+                <td><code>totalCollectableParkingHours</code></td>
+                <td>Billable time after rounding to billing blocks.</td>
+                <td>Used with revenue policy to calculate revenue.</td>
+              </tr>
+              <tr>
+                <td><code>totalElevatorFloorsPassed</code></td>
+                <td>Total floor-to-floor elevator travel.</td>
+                <td>Proxy for elevator workload and energy use.</td>
+              </tr>
+              <tr>
+                <td><code>totalVmrDistanceMeters</code></td>
+                <td>Total distance moved by VMRs.</td>
+                <td>Proxy for VMR workload and maintenance.</td>
+              </tr>
+              <tr>
+                <td><code>totalRevenue</code></td>
+                <td>Revenue calculated from billable parking blocks.</td>
+                <td>Compare only when demand and billing policy are comparable.</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="tips">
+          <h2>Scenario Tips</h2>
+          <ul class="plain-list">
+            <li>Change one major assumption at a time when comparing two runs.</li>
+            <li>Keep the same <code>seed</code> when comparing strategy changes; this keeps demand comparable.</li>
+            <li>Use different downloaded filenames for scenarios you want to keep.</li>
+            <li>Read averages and longest waits together. Both matter for user experience.</li>
+            <li>High occupancy, high induced vehicles, and high outbound wait usually point to blocked-retrieval pressure.</li>
+            <li>High inbound balking usually means arrival demand is too high for the modeled garage capacity and process speed.</li>
+          </ul>
+        </section>
+      </article>
+    </main>
+  </body>
+</html>
