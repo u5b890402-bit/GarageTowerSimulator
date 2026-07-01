@@ -264,15 +264,28 @@ export interface GarageStateSnapshot {
 
 export interface OccupancyState {
   occupied: CellOccupancy[];
+  reservations?: CellReservation[];
   occupiedCount: number;
+  reservedCount?: number;
+  effectiveOccupiedCount?: number;
   totalParkingCells: number;
   occupancyPercent: number;
+  effectiveOccupancyPercent?: number;
 }
 
 export interface CellOccupancy {
   cellId: CellId;
   vehicleId: VehicleId;
   parkedAt: SimTime;
+}
+
+export interface CellReservation {
+  cellId: CellId;
+  vehicleId: VehicleId;
+  operationId: string;
+  reservedAt: SimTime;
+  expectedOccupiedAt: SimTime;
+  purpose: "ParkInbound" | "RelocateBlocker" | "IdleUnblock";
 }
 
 export interface QueueState {
@@ -703,8 +716,11 @@ export interface RawSimulationStateRecord {
   t: SimTime;
   occupancy: {
     occupiedCount: number;
+    reservedCount?: number;
+    effectiveOccupiedCount?: number;
     totalParkingCells: number;
     occupancyPercent: number;
+    effectiveOccupancyPercent?: number;
   };
   queues: {
     inboundLength: number;

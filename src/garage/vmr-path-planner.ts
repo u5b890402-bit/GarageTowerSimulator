@@ -6,6 +6,7 @@ import type {
   VmrPath,
 } from "../domain/types.js";
 import { GridGarageLayout } from "./grid-layout.js";
+import { effectiveOccupiedCellIds } from "./occupancy.js";
 
 interface Coordinate {
   row: number;
@@ -34,7 +35,7 @@ export class GridVmrPathPlanner {
   findAccessPlan(cellId: CellId, occupancy: OccupancyState): VmrAccessPlan | null {
     const path = this.findPath(cellId, occupancy, true);
     if (!path) return null;
-    const occupied = new Set(occupancy.occupied.map((cell) => cell.cellId));
+    const occupied = effectiveOccupiedCellIds(occupancy);
     return {
       path,
       blockerCells: path.cells.filter(
@@ -69,7 +70,7 @@ export class GridVmrPathPlanner {
     endpointCell: CellId,
     endpointMayBeOccupied: boolean,
   ): boolean {
-    const occupied = new Set(occupancy.occupied.map((cell) => cell.cellId));
+    const occupied = effectiveOccupiedCellIds(occupancy);
     return path.cells.every(
       (cellId) =>
         !occupied.has(cellId) ||
@@ -92,7 +93,7 @@ export class GridVmrPathPlanner {
     const floor = target.floor;
     const startKey = this.coordinateKey(this.elevatorCoordinate);
     const targetKey = this.coordinateKey(target);
-    const occupied = new Set(occupancy.occupied.map((cell) => cell.cellId));
+    const occupied = effectiveOccupiedCellIds(occupancy);
     const frontier: Array<{ key: string; blockers: number; steps: number }> = [
       { key: startKey, blockers: 0, steps: 0 },
     ];

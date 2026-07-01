@@ -2,13 +2,37 @@ define("domain/types", ["require", "exports"], function (require, exports) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
 });
-define("garage/strategies", ["require", "exports"], function (require, exports) {
+define("garage/occupancy", ["require", "exports"], function (require, exports) {
+    "use strict";
+    Object.defineProperty(exports, "__esModule", { value: true });
+    exports.effectiveOccupiedCellIds = effectiveOccupiedCellIds;
+    exports.effectiveOccupiedCells = effectiveOccupiedCells;
+    function effectiveOccupiedCellIds(occupancy) {
+        return new Set(effectiveOccupiedCells(occupancy).map((cell) => cell.cellId));
+    }
+    function effectiveOccupiedCells(occupancy) {
+        const byCell = new Map();
+        for (const cell of occupancy.occupied) {
+            byCell.set(cell.cellId, { cellId: cell.cellId, vehicleId: cell.vehicleId });
+        }
+        for (const reservation of occupancy.reservations ?? []) {
+            if (!byCell.has(reservation.cellId)) {
+                byCell.set(reservation.cellId, {
+                    cellId: reservation.cellId,
+                    vehicleId: reservation.vehicleId,
+                });
+            }
+        }
+        return [...byCell.values()];
+    }
+});
+define("garage/strategies", ["require", "exports", "garage/occupancy"], function (require, exports, occupancy_js_1) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
     exports.IdleAfterTenMinutesUnblockingStrategy = exports.NoopUnblockingStrategy = exports.FixedPreparationPositionPolicy = exports.SimpleRetrievalStrategy = exports.FirstAvailablePlacementStrategy = exports.LowestCostPlacementStrategy = void 0;
     class LowestCostPlacementStrategy {
         rankCandidateCells(context) {
-            const occupied = new Set(context.occupancy.occupied.map((cell) => cell.cellId));
+            const occupied = (0, occupancy_js_1.effectiveOccupiedCellIds)(context.occupancy);
             return context.layout
                 .getParkingCells()
                 .filter((cellId) => !occupied.has(cellId))
@@ -27,7 +51,7 @@ define("garage/strategies", ["require", "exports"], function (require, exports) 
     exports.LowestCostPlacementStrategy = LowestCostPlacementStrategy;
     class FirstAvailablePlacementStrategy {
         rankCandidateCells(context) {
-            const occupied = new Set(context.occupancy.occupied.map((cell) => cell.cellId));
+            const occupied = (0, occupancy_js_1.effectiveOccupiedCellIds)(context.occupancy);
             return context.layout
                 .getParkingCells()
                 .filter((cellId) => !occupied.has(cellId))
@@ -532,23 +556,35 @@ define("garage/elevator-trip-planner", ["require", "exports"], function (require
             return {
                 ...occupancy,
                 occupied: occupancy.occupied.map((cell) => ({ ...cell })),
+                reservations: (occupancy.reservations ?? []).map((reservation) => ({
+                    ...reservation,
+                })),
             };
         }
         addOccupancy(occupancy, cellId, vehicleId, parkedAt) {
+            occupancy.reservations = (occupancy.reservations ?? []).filter((reservation) => reservation.cellId !== cellId && reservation.vehicleId !== vehicleId);
             occupancy.occupied.push({ cellId, vehicleId, parkedAt });
-            occupancy.occupiedCount = occupancy.occupied.length;
-            occupancy.occupancyPercent =
-                occupancy.totalParkingCells === 0
-                    ? 0
-                    : occupancy.occupiedCount / occupancy.totalParkingCells;
+            this.recalculateOccupancyCounts(occupancy);
         }
         removeVehicleFromOccupancy(occupancy, vehicleId) {
             occupancy.occupied = occupancy.occupied.filter((cell) => cell.vehicleId !== vehicleId);
+            occupancy.reservations = (occupancy.reservations ?? []).filter((reservation) => reservation.vehicleId !== vehicleId);
+            this.recalculateOccupancyCounts(occupancy);
+        }
+        recalculateOccupancyCounts(occupancy) {
             occupancy.occupiedCount = occupancy.occupied.length;
+            const occupiedCellIds = new Set(occupancy.occupied.map((cell) => cell.cellId));
+            const reservedCount = (occupancy.reservations ?? []).filter((reservation) => !occupiedCellIds.has(reservation.cellId)).length;
+            occupancy.reservedCount = reservedCount;
+            occupancy.effectiveOccupiedCount = occupancy.occupiedCount + reservedCount;
             occupancy.occupancyPercent =
                 occupancy.totalParkingCells === 0
                     ? 0
                     : occupancy.occupiedCount / occupancy.totalParkingCells;
+            occupancy.effectiveOccupancyPercent =
+                occupancy.totalParkingCells === 0
+                    ? 0
+                    : occupancy.effectiveOccupiedCount / occupancy.totalParkingCells;
         }
     }
     exports.BaselineElevatorTripPlanner = BaselineElevatorTripPlanner;
@@ -1221,8 +1257,13 @@ define("simulation/compact-records", ["require", "exports"], function (require, 
             t: record.time,
             occupancy: {
                 occupiedCount: record.afterSnapshot.occupancy.occupiedCount,
+                reservedCount: record.afterSnapshot.occupancy.reservedCount ?? 0,
+                effectiveOccupiedCount: record.afterSnapshot.occupancy.effectiveOccupiedCount ??
+                    record.afterSnapshot.occupancy.occupiedCount,
                 totalParkingCells: record.afterSnapshot.occupancy.totalParkingCells,
                 occupancyPercent: record.afterSnapshot.occupancy.occupancyPercent,
+                effectiveOccupancyPercent: record.afterSnapshot.occupancy.effectiveOccupancyPercent ??
+                    record.afterSnapshot.occupancy.occupancyPercent,
             },
             queues: {
                 inboundLength: record.afterSnapshot.queues.inboundLength,
@@ -1291,7 +1332,7 @@ define("simulation/in-memory-recorder", ["require", "exports", "simulation/compa
     }
     exports.InMemorySimulationStateRecorder = InMemorySimulationStateRecorder;
 });
-define("garage/grid-layout", ["require", "exports"], function (require, exports) {
+define("garage/grid-layout", ["require", "exports", "garage/occupancy"], function (require, exports, occupancy_js_2) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
     exports.GridGarageLayout = void 0;
@@ -1332,7 +1373,7 @@ define("garage/grid-layout", ["require", "exports"], function (require, exports)
             const target = this.getCellGeometry(cellId);
             const centerRow = Math.ceil(this.config.rows / 2);
             const centerColumn = Math.ceil(this.config.columns / 2);
-            const occupied = new Set(occupancy.occupied.map((cell) => cell.cellId));
+            const occupied = (0, occupancy_js_2.effectiveOccupiedCellIds)(occupancy);
             const horizontalFirst = this.buildPath(target.floor, centerRow, centerColumn, target.row, target.column, true);
             const verticalFirst = this.buildPath(target.floor, centerRow, centerColumn, target.row, target.column, false);
             const candidates = [horizontalFirst, verticalFirst]
@@ -1349,7 +1390,7 @@ define("garage/grid-layout", ["require", "exports"], function (require, exports)
                 ],
                 occupiedCount: occupancy.occupiedCount + 1,
             };
-            const occupied = new Set(candidateOccupancy.occupied.map((cell) => cell.cellId));
+            const occupied = (0, occupancy_js_2.effectiveOccupiedCellIds)(candidateOccupancy);
             return this.parkingCells.some((parkingCell) => !occupied.has(parkingCell) &&
                 this.getBlockingCells(parkingCell, candidateOccupancy).length > 0);
         }
@@ -1408,7 +1449,7 @@ define("garage/grid-layout", ["require", "exports"], function (require, exports)
     }
     exports.GridGarageLayout = GridGarageLayout;
 });
-define("garage/vmr-path-planner", ["require", "exports"], function (require, exports) {
+define("garage/vmr-path-planner", ["require", "exports", "garage/occupancy"], function (require, exports, occupancy_js_3) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
     exports.GridVmrPathPlanner = void 0;
@@ -1426,7 +1467,7 @@ define("garage/vmr-path-planner", ["require", "exports"], function (require, exp
             const path = this.findPath(cellId, occupancy, true);
             if (!path)
                 return null;
-            const occupied = new Set(occupancy.occupied.map((cell) => cell.cellId));
+            const occupied = (0, occupancy_js_3.effectiveOccupiedCellIds)(occupancy);
             return {
                 path,
                 blockerCells: path.cells.filter((pathCell) => pathCell !== cellId && occupied.has(pathCell)),
@@ -1447,7 +1488,7 @@ define("garage/vmr-path-planner", ["require", "exports"], function (require, exp
             return this.roundTrip(outward);
         }
         isClear(path, occupancy, endpointCell, endpointMayBeOccupied) {
-            const occupied = new Set(occupancy.occupied.map((cell) => cell.cellId));
+            const occupied = (0, occupancy_js_3.effectiveOccupiedCellIds)(occupancy);
             return path.cells.every((cellId) => !occupied.has(cellId) ||
                 (cellId === endpointCell && endpointMayBeOccupied));
         }
@@ -1462,7 +1503,7 @@ define("garage/vmr-path-planner", ["require", "exports"], function (require, exp
             const floor = target.floor;
             const startKey = this.coordinateKey(this.elevatorCoordinate);
             const targetKey = this.coordinateKey(target);
-            const occupied = new Set(occupancy.occupied.map((cell) => cell.cellId));
+            const occupied = (0, occupancy_js_3.effectiveOccupiedCellIds)(occupancy);
             const frontier = [
                 { key: startKey, blockers: 0, steps: 0 },
             ];
@@ -1585,6 +1626,7 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
             this.inboundQueue = [];
             this.outboundQueue = [];
             this.parked = new Map();
+            this.cellReservations = new Map();
             this.requestedOutbound = new Set();
             this.preparationPositions = [];
             this.decks = [];
@@ -1604,6 +1646,7 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
             this.inboundQueue = [];
             this.outboundQueue = [];
             this.parked.clear();
+            this.cellReservations.clear();
             this.requestedOutbound.clear();
             this.trip = null;
             this.elevatorFloor = 1;
@@ -2000,7 +2043,6 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
                 this.elevatorDirection = group.elevatorDirection;
             }
             const operations = group.actions.map((action, index) => {
-                this.applyActionStart(action, context.time);
                 const operation = {
                     id: `${this.trip?.state.id}-${this.trip?.groupIndex}-${index}`,
                     type: action.type,
@@ -2011,6 +2053,7 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
                     ...(action.to ? { to: action.to } : {}),
                     ...(action.path ? { path: action.path } : {}),
                 };
+                this.applyActionStart(action, context.time, operation);
                 if (action.deckIndex !== undefined && action.type !== "RotateDeck") {
                     this.startVmrTask(action.deckIndex, operation);
                 }
@@ -2078,18 +2121,16 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
             }
             this.trip = null;
         }
-        applyActionStart(action, time) {
-            if (action.type !== "OperateDoor" ||
-                !action.preparationPositionId ||
-                !action.doorFinalState) {
-                return;
+        applyActionStart(action, time, operation) {
+            this.reserveDestinationCell(action, time, operation);
+            if (action.type === "OperateDoor" && action.preparationPositionId && action.doorFinalState) {
+                const position = this.findPp(action.preparationPositionId);
+                if (!position)
+                    return;
+                position.doorState =
+                    action.doorFinalState === "open" ? "opening" : "closing";
+                position.doorTransitionCompleteAt = time + action.durationSeconds;
             }
-            const position = this.findPp(action.preparationPositionId);
-            if (!position)
-                return;
-            position.doorState =
-                action.doorFinalState === "open" ? "opening" : "closing";
-            position.doorTransitionCompleteAt = time + action.durationSeconds;
         }
         applyActionComplete(action, time) {
             const deck = action.deckIndex === undefined ? undefined : this.decks[action.deckIndex];
@@ -2161,6 +2202,7 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
                             cellId: action.to,
                             parkedAt: time,
                         });
+                        this.releaseReservation(action.to);
                     }
                     if (action.deckIndex !== undefined)
                         this.clearDeck(action.deckIndex);
@@ -2172,6 +2214,7 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
                             cellId: action.to,
                             parkedAt: time,
                         });
+                        this.releaseReservation(action.to);
                         this.counters.inboundCompleted += 1;
                         this.counters.downwardTripPlacements += 1;
                     }
@@ -2201,6 +2244,7 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
                             cellId: action.to,
                             parkedAt: time,
                         });
+                        this.releaseReservation(action.to);
                         this.counters.idleUnblockingActions += 1;
                         this.counters.idleUnblockedVehicles += 1;
                     }
@@ -2333,6 +2377,28 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
         findPp(id) {
             return this.preparationPositions.find((position) => position.id === id);
         }
+        reserveDestinationCell(action, time, operation) {
+            if (!this.isCellReservationPurpose(action.type) || !action.vehicleId || !action.to?.startsWith("f")) {
+                return;
+            }
+            const cellId = action.to;
+            this.cellReservations.set(cellId, {
+                cellId,
+                vehicleId: action.vehicleId,
+                operationId: operation.id,
+                reservedAt: time,
+                expectedOccupiedAt: operation.completesAt,
+                purpose: action.type,
+            });
+        }
+        releaseReservation(cellId) {
+            this.cellReservations.delete(cellId);
+        }
+        isCellReservationPurpose(type) {
+            return (type === "ParkInbound" ||
+                type === "RelocateBlocker" ||
+                type === "IdleUnblock");
+        }
         taskDistance(from, to) {
             const cell = [from, to].find((value) => value?.startsWith("f"));
             if (cell) {
@@ -2357,12 +2423,23 @@ define("garage/simple-garage", ["require", "exports", "garage/grid-layout", "gar
                 vehicleId: record.vehicleId,
                 parkedAt: record.parkedAt,
             }));
+            const reservations = [...this.cellReservations.values()].map((reservation) => ({
+                ...reservation,
+            }));
+            const reservedCellIds = new Set(reservations
+                .filter((reservation) => !occupied.some((cell) => cell.cellId === reservation.cellId))
+                .map((reservation) => reservation.cellId));
             const totalParkingCells = this.layout.getParkingCells().length;
+            const effectiveOccupiedCount = occupied.length + reservedCellIds.size;
             return {
                 occupied,
+                reservations,
                 occupiedCount: occupied.length,
+                reservedCount: reservedCellIds.size,
+                effectiveOccupiedCount,
                 totalParkingCells,
                 occupancyPercent: totalParkingCells === 0 ? 0 : occupied.length / totalParkingCells,
+                effectiveOccupancyPercent: totalParkingCells === 0 ? 0 : effectiveOccupiedCount / totalParkingCells,
             };
         }
         inboundVehiclesInPhysicalSystem() {
@@ -2824,6 +2901,9 @@ define("browser/app", ["require", "exports", "config/validate-config", "garage/s
         const configInput = getElement("config-input");
         const runButton = getElement("run-button");
         const loadExampleButton = getElement("load-example-button");
+        const loadConfigButton = getElement("load-config-button");
+        const saveConfigButton = getElement("save-config-button");
+        const configFileInput = getElement("config-file-input");
         const rawDownloadButton = getElement("download-raw-button");
         const reportDownloadButton = getElement("download-report-button");
         configInput.value = JSON.stringify(exampleConfig, null, 2);
@@ -2832,6 +2912,19 @@ define("browser/app", ["require", "exports", "config/validate-config", "garage/s
             configInput.value = JSON.stringify(exampleConfig, null, 2);
             syncStrategyControlsFromConfig(configInput);
             setStatus("Example configuration loaded.");
+        });
+        loadConfigButton.addEventListener("click", () => {
+            configFileInput.click();
+        });
+        configFileInput.addEventListener("change", () => {
+            const file = configFileInput.files?.[0];
+            configFileInput.value = "";
+            if (!file)
+                return;
+            void loadConfigFile(file, configInput);
+        });
+        saveConfigButton.addEventListener("click", () => {
+            saveCurrentConfig(configInput);
         });
         configInput.addEventListener("change", () => syncStrategyControlsFromConfig(configInput));
         runButton.addEventListener("click", () => {
@@ -2845,6 +2938,41 @@ define("browser/app", ["require", "exports", "config/validate-config", "garage/s
             if (latestRun)
                 downloadText("parking-tower-report.json", latestRun.reportJson, "application/json");
         });
+    }
+    async function loadConfigFile(file, configInput) {
+        try {
+            const text = await file.text();
+            configInput.value = text;
+            const config = JSON.parse(text);
+            const validation = (0, validate_config_js_1.validateSimulationConfig)(config);
+            if (!validation.valid) {
+                syncStrategyControlsFromConfig(configInput);
+                throw new Error(validation.errors.join("\n"));
+            }
+            configInput.value = JSON.stringify(config, null, 2);
+            syncStrategyControlsFromConfig(configInput);
+            setStatus(`Configuration loaded: ${file.name}`);
+        }
+        catch (error) {
+            setStatus(`Configuration file loaded, but it needs attention:\n${error instanceof Error ? error.message : String(error)}`, true);
+        }
+    }
+    function saveCurrentConfig(configInput) {
+        try {
+            const config = JSON.parse(configInput.value);
+            const validation = (0, validate_config_js_1.validateSimulationConfig)(config);
+            if (!validation.valid) {
+                throw new Error(validation.errors.join("\n"));
+            }
+            const filename = `${safeFilename(config.simulation.sessionName || "parking-tower-config")}.json`;
+            const text = JSON.stringify(config, null, 2);
+            configInput.value = text;
+            downloadText(filename, text, "application/json");
+            setStatus(`Configuration saved: ${filename}`);
+        }
+        catch (error) {
+            setStatus(`Configuration was not saved:\n${error instanceof Error ? error.message : String(error)}`, true);
+        }
     }
     function initializeStrategyControls(configInput) {
         const descriptors = (0, strategy_registry_js_3.getStrategyDescriptors)();
@@ -2972,6 +3100,9 @@ define("browser/app", ["require", "exports", "config/validate-config", "garage/s
         for (const id of [
             "run-button",
             "load-example-button",
+            "load-config-button",
+            "save-config-button",
+            "config-file-input",
             "config-input",
             ...Object.values(strategyControlIds),
         ]) {
@@ -3003,6 +3134,13 @@ define("browser/app", ["require", "exports", "config/validate-config", "garage/s
         link.click();
         URL.revokeObjectURL(url);
     }
+    function safeFilename(value) {
+        const cleaned = value
+            .trim()
+            .replace(/[^a-z0-9._-]+/gi, "-")
+            .replace(/^-+|-+$/g, "");
+        return cleaned || "parking-tower-config";
+    }
     function yieldToBrowser() {
         return new Promise((resolve) => window.setTimeout(resolve, 0));
     }
@@ -3012,5 +3150,1422 @@ define("browser/app", ["require", "exports", "config/validate-config", "garage/s
             throw new Error(`Missing element: ${id}`);
         }
         return element;
+    }
+});
+define("browser/visualizer", ["require", "exports"], function (require, exports) {
+    "use strict";
+    Object.defineProperty(exports, "__esModule", { value: true });
+    exports.startVisualizer = startVisualizer;
+    const playbackSecondsPerSecond = 20;
+    const frameCacheMaxEntries = 360;
+    const parkingCellLengthMeters = 6;
+    const parkingCellWidthMeters = 3;
+    const vehicleLengthMeters = 5;
+    const vehicleWidthMeters = 2;
+    const vmrLengthMeters = 5.5;
+    const vmrWidthMeters = 2.5;
+    function startVisualizer() {
+        const root = document.querySelector("[data-visualizer-root]");
+        if (!root)
+            return;
+        new BrowserVisualizerApp(root).start();
+    }
+    class BrowserVisualizerApp {
+        constructor(root) {
+            this.root = root;
+            this.dataSet = null;
+            this.replayEngine = null;
+            this.isPlaying = false;
+            this.lastAnimationTime = 0;
+            this.currentTime = 0;
+            this.animationHandle = 0;
+            this.loader = new JsonlVisualizerRawOutputLoader();
+            this.physicalRenderer = new CanvasPhysicalStateRenderer();
+            this.computationalRenderer = new HtmlComputationalStateRenderer();
+            this.fileInput = requiredElement(root, "#raw-output-input", HTMLInputElement);
+            this.status = requiredElement(root, "#visualizer-status", HTMLElement);
+            this.playButton = requiredElement(root, "#play-button", HTMLButtonElement);
+            this.pauseButton = requiredElement(root, "#pause-button", HTMLButtonElement);
+            this.slider = requiredElement(root, "#time-slider", HTMLInputElement);
+            this.timeReadout = requiredElement(root, "#time-readout", HTMLElement);
+            this.physicalView = requiredElement(root, "#physical-state-view", HTMLElement);
+            this.computationalView = requiredElement(root, "#computational-state-view", HTMLElement);
+        }
+        start() {
+            this.fileInput.addEventListener("change", () => void this.loadSelectedFile());
+            this.playButton.addEventListener("click", () => this.play());
+            this.pauseButton.addEventListener("click", () => this.pause());
+            this.slider.addEventListener("input", () => {
+                this.pause();
+                this.seek(Number(this.slider.value));
+            });
+            this.setControls(false);
+            this.setStatus("Select a raw JSONL output file to inspect.", "normal");
+        }
+        async loadSelectedFile() {
+            const file = this.fileInput.files?.[0];
+            if (!file)
+                return;
+            this.pause();
+            this.setStatus(`Loading ${file.name}...`, "normal");
+            try {
+                this.dataSet = await this.loader.load(file);
+                this.replayEngine = new CheckpointReplayEngine(this.dataSet);
+                this.currentTime = 0;
+                this.slider.min = "0";
+                this.slider.max = String(this.dataSet.durationSeconds);
+                this.slider.step = "1";
+                this.slider.value = "0";
+                this.setControls(true);
+                this.renderCurrentFrame();
+                this.setStatus(`Loaded ${file.name}. ${this.dataSet.records.length.toLocaleString()} records, ${this.dataSet.checkpoints.length.toLocaleString()} checkpoints.`, "normal");
+            }
+            catch (error) {
+                this.dataSet = null;
+                this.replayEngine = null;
+                this.setControls(false);
+                this.setStatus(error instanceof Error ? error.message : String(error), "error");
+            }
+        }
+        play() {
+            if (!this.replayEngine || this.isPlaying)
+                return;
+            this.isPlaying = true;
+            this.lastAnimationTime = performance.now();
+            this.animationHandle = requestAnimationFrame((timestamp) => this.advance(timestamp));
+            this.setControls(true);
+        }
+        pause() {
+            if (this.animationHandle) {
+                cancelAnimationFrame(this.animationHandle);
+                this.animationHandle = 0;
+            }
+            this.isPlaying = false;
+            this.setControls(Boolean(this.replayEngine));
+        }
+        advance(timestamp) {
+            if (!this.isPlaying || !this.dataSet)
+                return;
+            const elapsedSeconds = (timestamp - this.lastAnimationTime) / 1000;
+            this.lastAnimationTime = timestamp;
+            const nextTime = Math.min(this.dataSet.durationSeconds, this.currentTime + elapsedSeconds * playbackSecondsPerSecond);
+            this.seek(nextTime);
+            if (nextTime >= this.dataSet.durationSeconds) {
+                this.pause();
+                return;
+            }
+            this.animationHandle = requestAnimationFrame((nextTimestamp) => this.advance(nextTimestamp));
+        }
+        seek(time) {
+            if (!this.dataSet)
+                return;
+            this.currentTime = clamp(time, 0, this.dataSet.durationSeconds);
+            this.slider.value = String(Math.round(this.currentTime));
+            this.renderCurrentFrame();
+        }
+        renderCurrentFrame() {
+            if (!this.replayEngine || !this.dataSet)
+                return;
+            const frame = this.replayEngine.getFrameAt(Math.round(this.currentTime));
+            this.timeReadout.textContent = formatDuration(frame.time);
+            this.physicalRenderer.render(this.physicalView, frame, this.dataSet.metadata.config.garage);
+            this.computationalRenderer.render(this.computationalView, frame, this.dataSet.metadata.config);
+        }
+        setControls(enabled) {
+            this.playButton.disabled = !enabled || this.isPlaying;
+            this.pauseButton.disabled = !enabled || !this.isPlaying;
+            this.slider.disabled = !enabled;
+        }
+        setStatus(message, state) {
+            this.status.textContent = message;
+            this.status.dataset.state = state;
+        }
+    }
+    class JsonlVisualizerRawOutputLoader {
+        async load(file) {
+            const text = await file.text();
+            const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+            if (lines.length === 0)
+                throw new Error("The selected file is empty.");
+            let metadata = null;
+            const records = [];
+            const checkpoints = [];
+            for (let index = 0; index < lines.length; index += 1) {
+                const line = lines[index];
+                if (!line)
+                    continue;
+                let parsed;
+                try {
+                    parsed = JSON.parse(line);
+                }
+                catch (error) {
+                    throw new Error(`Line ${index + 1} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+                }
+                if (parsed.kind === "metadata") {
+                    metadata = parsed;
+                    continue;
+                }
+                records.push(parsed);
+                if (parsed.kind === "checkpoint")
+                    checkpoints.push(parsed);
+            }
+            if (!metadata)
+                throw new Error("The raw output does not contain a metadata record.");
+            const loadedMetadata = metadata;
+            if (checkpoints.length === 0)
+                throw new Error("The raw output does not contain checkpoints, so it cannot be replayed.");
+            records.sort((a, b) => recordTime(a) - recordTime(b));
+            checkpoints.sort((a, b) => a.t - b.t);
+            return {
+                metadata: loadedMetadata,
+                records,
+                checkpoints,
+                durationSeconds: loadedMetadata.config.simulation.durationSeconds,
+            };
+        }
+    }
+    class CheckpointReplayEngine {
+        constructor(dataSet) {
+            this.dataSet = dataSet;
+            this.cache = new Map();
+        }
+        getFrameAt(time) {
+            const key = Math.round(clamp(time, 0, this.dataSet.durationSeconds));
+            const cached = this.cache.get(key);
+            if (cached) {
+                this.cache.delete(key);
+                this.cache.set(key, cached);
+                return cached;
+            }
+            const checkpoint = this.closestCheckpointAtOrBefore(key);
+            const cachedBase = this.closestCachedFrameAtOrBefore(key, checkpoint.t);
+            const baseTime = cachedBase ? cachedBase.time : checkpoint.t;
+            const snapshot = cachedBase
+                ? cloneValue(cachedBase.snapshot)
+                : cloneValue(checkpoint.snapshot);
+            for (const record of this.dataSet.records) {
+                const t = recordTime(record);
+                if (t <= baseTime)
+                    continue;
+                if (t > key)
+                    break;
+                this.applyRecord(snapshot, record);
+            }
+            snapshot.time = key;
+            this.cleanupActiveOperations(snapshot, key);
+            this.recalculateDerivedState(snapshot);
+            const elevatorDestination = this.currentElevatorDestination(snapshot.activeOperations);
+            const frame = {
+                time: key,
+                snapshot,
+                interpolatedOperations: snapshot.activeOperations.map((operation) => interpolateOperation(operation, key)),
+                ...(elevatorDestination !== undefined ? { elevatorDestination } : {}),
+            };
+            this.rememberFrame(key, frame);
+            return frame;
+        }
+        closestCheckpointAtOrBefore(time) {
+            let low = 0;
+            let high = this.dataSet.checkpoints.length - 1;
+            let result = this.dataSet.checkpoints[0];
+            if (!result)
+                throw new Error("No checkpoints are available.");
+            while (low <= high) {
+                const mid = Math.floor((low + high) / 2);
+                const candidate = this.dataSet.checkpoints[mid];
+                if (!candidate)
+                    break;
+                if (candidate.t <= time) {
+                    result = candidate;
+                    low = mid + 1;
+                }
+                else {
+                    high = mid - 1;
+                }
+            }
+            return result;
+        }
+        closestCachedFrameAtOrBefore(time, checkpointTime) {
+            let result = null;
+            for (const [cachedTime, frame] of this.cache) {
+                if (cachedTime <= checkpointTime || cachedTime >= time)
+                    continue;
+                if (!result || cachedTime > result.time)
+                    result = frame;
+            }
+            if (result) {
+                this.cache.delete(result.time);
+                this.cache.set(result.time, result);
+            }
+            return result;
+        }
+        applyRecord(snapshot, record) {
+            switch (record.kind) {
+                case "events":
+                    this.applyEvents(snapshot, record);
+                    break;
+                case "operations":
+                    this.applyOperations(snapshot, record);
+                    break;
+                case "state":
+                    this.applyState(snapshot, record);
+                    break;
+                case "checkpoint":
+                case "second":
+                    break;
+            }
+        }
+        applyEvents(snapshot, record) {
+            for (const result of record.intake) {
+                if (!result.accepted)
+                    continue;
+                const event = record.generated.find((candidate) => candidate.id === result.eventId);
+                const queued = {
+                    vehicleId: result.vehicleId,
+                    queuedAt: event?.time ?? record.t,
+                };
+                if (result.outcome === "QueuedInbound") {
+                    if (!snapshot.queues.inbound.some((item) => item.vehicleId === result.vehicleId)) {
+                        snapshot.queues.inbound.push(queued);
+                    }
+                }
+                if (result.outcome === "QueuedOutbound") {
+                    if (!snapshot.queues.outbound.some((item) => item.vehicleId === result.vehicleId)) {
+                        snapshot.queues.outbound.push(queued);
+                    }
+                }
+            }
+        }
+        applyOperations(snapshot, record) {
+            for (const operation of record.started ?? []) {
+                if (!snapshot.activeOperations.some((active) => active.id === operation.id)) {
+                    snapshot.activeOperations.push(cloneValue(operation));
+                }
+                this.applyOperationStart(snapshot, operation);
+            }
+            for (const operation of record.completed ?? []) {
+                this.applyOperationComplete(snapshot, operation, record.t);
+            }
+        }
+        applyState(snapshot, record) {
+            snapshot.counters = cloneValue(record.counters);
+            snapshot.occupancy.reservedCount =
+                record.occupancy.reservedCount ?? snapshot.occupancy.reservedCount ?? 0;
+            snapshot.occupancy.effectiveOccupiedCount =
+                record.occupancy.effectiveOccupiedCount ??
+                    snapshot.occupancy.effectiveOccupiedCount ??
+                    snapshot.occupancy.occupiedCount;
+            snapshot.occupancy.effectiveOccupancyPercent =
+                record.occupancy.effectiveOccupancyPercent ??
+                    snapshot.occupancy.effectiveOccupancyPercent ??
+                    snapshot.occupancy.occupancyPercent;
+        }
+        applyOperationStart(snapshot, operation) {
+            if (operation.type === "MoveElevator") {
+                const destination = elevatorPosition(operation.to);
+                snapshot.elevator.status = "Busy";
+                if (destination !== null) {
+                    snapshot.elevator.direction =
+                        destination > snapshot.elevator.currentFloor
+                            ? "up"
+                            : destination < snapshot.elevator.currentFloor
+                                ? "down"
+                                : "stopped";
+                }
+                return;
+            }
+            reserveDestinationForOperation(snapshot, operation);
+            const deckIndex = operationDeckIndex(operation);
+            if (deckIndex === null)
+                return;
+            const vmr = snapshot.vmrs[deckIndex];
+            if (!vmr)
+                return;
+            vmr.status = "Busy";
+            vmr.currentTask = {
+                type: operation.type,
+                startedAt: operation.startedAt,
+                completesAt: operation.completesAt,
+                ...(operation.from ? { from: operation.from } : {}),
+                ...(operation.to ? { to: operation.to } : {}),
+                ...(operation.vehicleId ? { vehicleId: operation.vehicleId } : {}),
+                ...(operation.path ? { path: operation.path } : {}),
+            };
+        }
+        applyOperationComplete(snapshot, operation, time) {
+            snapshot.activeOperations = snapshot.activeOperations.filter((active) => {
+                if (active.completesAt > time)
+                    return true;
+                if (active.type !== operation.type)
+                    return true;
+                if (operation.vehicleId && active.vehicleId !== operation.vehicleId)
+                    return true;
+                return false;
+            });
+            switch (operation.type) {
+                case "EnterInboundPreparationPosition":
+                    this.enterInboundPreparationPosition(snapshot, operation, time);
+                    break;
+                case "LoadInbound":
+                    this.loadDeckFromPreparationPosition(snapshot, operation, "inbound");
+                    break;
+                case "ParkInbound":
+                    this.parkFromDeck(snapshot, operation, time);
+                    break;
+                case "MoveBlocker":
+                case "LoadOutbound":
+                    this.loadDeckFromCell(snapshot, operation, operation.type === "LoadOutbound" ? "outbound" : "blocker");
+                    break;
+                case "RelocateBlocker":
+                case "IdleUnblock":
+                    this.parkFromDeck(snapshot, operation, time);
+                    break;
+                case "RetrieveOutbound":
+                    this.retrieveOutbound(snapshot, operation, time);
+                    break;
+                case "MoveElevator":
+                    this.moveElevator(snapshot, operation);
+                    break;
+                case "RotateDeck":
+                    this.rotateDeck(snapshot, operation);
+                    break;
+                case "OperateDoor":
+                    this.operateDoor(snapshot, operation, time);
+                    break;
+                case "UnloadOutbound":
+                    break;
+            }
+            this.finishVmrForOperation(snapshot, operation);
+            releaseReservationForCompletedOperation(snapshot, operation);
+        }
+        enterInboundPreparationPosition(snapshot, operation, time) {
+            if (!operation.vehicleId)
+                return;
+            const positionId = stringDetail(operation.detail, "preparationPositionId");
+            const position = positionId
+                ? snapshot.preparationPositions.find((candidate) => candidate.id === positionId)
+                : undefined;
+            if (position) {
+                position.occupiedBy = operation.vehicleId;
+                position.readyAt = time;
+                position.doorState = "open";
+            }
+            snapshot.queues.inbound = snapshot.queues.inbound.filter((item) => item.vehicleId !== operation.vehicleId);
+        }
+        loadDeckFromPreparationPosition(snapshot, operation, role) {
+            if (!operation.vehicleId)
+                return;
+            const from = stringDetail(operation.detail, "from");
+            const to = stringDetail(operation.detail, "to");
+            const positionId = stringDetail(operation.detail, "preparationPositionId") ?? from;
+            const position = positionId
+                ? snapshot.preparationPositions.find((candidate) => candidate.id === positionId)
+                : undefined;
+            if (position) {
+                delete position.occupiedBy;
+                delete position.readyAt;
+            }
+            const deck = deckByLocation(snapshot.elevator.decks ?? [], to);
+            if (deck) {
+                deck.vehicleId = operation.vehicleId;
+                deck.vehicleRole = role;
+            }
+        }
+        loadDeckFromCell(snapshot, operation, role) {
+            if (!operation.vehicleId)
+                return;
+            const to = stringDetail(operation.detail, "to");
+            removeOccupiedVehicle(snapshot, operation.vehicleId);
+            const deck = deckByLocation(snapshot.elevator.decks ?? [], to);
+            if (deck) {
+                deck.vehicleId = operation.vehicleId;
+                deck.vehicleRole = role;
+            }
+        }
+        parkFromDeck(snapshot, operation, time) {
+            if (!operation.vehicleId)
+                return;
+            const to = stringDetail(operation.detail, "to");
+            const from = stringDetail(operation.detail, "from");
+            if (to?.startsWith("f")) {
+                upsertOccupied(snapshot, {
+                    cellId: to,
+                    vehicleId: operation.vehicleId,
+                    parkedAt: time,
+                });
+            }
+            const deck = deckByLocation(snapshot.elevator.decks ?? [], from);
+            if (deck)
+                clearDeck(deck);
+        }
+        retrieveOutbound(snapshot, operation, time) {
+            if (!operation.vehicleId)
+                return;
+            const from = stringDetail(operation.detail, "from");
+            const to = stringDetail(operation.detail, "to");
+            const position = to
+                ? snapshot.preparationPositions.find((candidate) => candidate.id === to)
+                : undefined;
+            if (position) {
+                position.occupiedBy = operation.vehicleId;
+                position.readyAt = time;
+                position.doorState = "closed";
+            }
+            const deck = deckByLocation(snapshot.elevator.decks ?? [], from);
+            if (deck)
+                clearDeck(deck);
+            snapshot.queues.outbound = snapshot.queues.outbound.filter((item) => item.vehicleId !== operation.vehicleId);
+        }
+        moveElevator(snapshot, operation) {
+            const to = elevatorPosition(stringDetail(operation.detail, "to"));
+            if (to === null)
+                return;
+            snapshot.elevator.currentFloor = to;
+            snapshot.elevator.status = "Busy";
+            snapshot.elevator.direction = "stopped";
+            for (const deck of snapshot.elevator.decks ?? []) {
+                deck.alignedFloor = to - deck.index;
+            }
+        }
+        rotateDeck(snapshot, operation) {
+            const to = stringDetail(operation.detail, "to");
+            if (to !== "garage" && to !== "street")
+                return;
+            const group = stringDetail(operation.detail, "group");
+            const affectedDeck = inferDeckFromRotateGroup(snapshot.elevator.decks ?? [], group);
+            if (affectedDeck) {
+                affectedDeck.orientation = to;
+                return;
+            }
+            for (const deck of snapshot.elevator.decks ?? []) {
+                deck.orientation = to;
+            }
+        }
+        operateDoor(snapshot, operation, time) {
+            const to = stringDetail(operation.detail, "to");
+            if (to !== "open" && to !== "closed")
+                return;
+            const group = stringDetail(operation.detail, "group") ?? "";
+            const direction = group.includes("outbound") ? "outbound" : group.includes("inbound") ? "inbound" : null;
+            for (const position of snapshot.preparationPositions) {
+                if (direction && position.direction !== direction)
+                    continue;
+                position.doorState = to;
+                delete position.doorTransitionCompleteAt;
+                if (to === "open" && position.direction === "outbound" && position.occupiedBy) {
+                    position.readyAt = time;
+                }
+            }
+        }
+        finishVmrForOperation(snapshot, operation) {
+            const from = stringDetail(operation.detail, "from");
+            const to = stringDetail(operation.detail, "to");
+            const index = parseDeckIndex(from) ?? parseDeckIndex(to);
+            if (index === null)
+                return;
+            const vmr = snapshot.vmrs[index];
+            if (!vmr)
+                return;
+            vmr.status = "Idle";
+            delete vmr.currentTask;
+        }
+        cleanupActiveOperations(snapshot, time) {
+            snapshot.activeOperations = snapshot.activeOperations.filter((operation) => operation.completesAt > time);
+            const busyDeckIndexes = new Set();
+            for (const operation of snapshot.activeOperations) {
+                const deckIndex = operationDeckIndex(operation);
+                if (deckIndex !== null && operation.type !== "RotateDeck") {
+                    busyDeckIndexes.add(deckIndex);
+                }
+            }
+            snapshot.vmrs = snapshot.vmrs.map((vmr, index) => {
+                if (!busyDeckIndexes.has(index)) {
+                    const idle = { ...vmr, status: "Idle" };
+                    delete idle.currentTask;
+                    return idle;
+                }
+                return vmr;
+            });
+            snapshot.elevator.status = snapshot.activeOperations.length > 0 ? "Busy" : "IdleAtHome";
+        }
+        recalculateDerivedState(snapshot) {
+            snapshot.queues.inboundLength = snapshot.queues.inbound.length;
+            snapshot.queues.outboundLength = snapshot.queues.outbound.length;
+            snapshot.occupancy.occupied.sort((a, b) => a.cellId.localeCompare(b.cellId));
+            snapshot.occupancy.occupiedCount = snapshot.occupancy.occupied.length;
+            const occupiedCellIds = new Set(snapshot.occupancy.occupied.map((cell) => cell.cellId));
+            const reservedCount = (snapshot.occupancy.reservations ?? []).filter((reservation) => !occupiedCellIds.has(reservation.cellId)).length;
+            snapshot.occupancy.reservedCount = reservedCount;
+            snapshot.occupancy.effectiveOccupiedCount =
+                snapshot.occupancy.occupiedCount + reservedCount;
+            snapshot.occupancy.occupancyPercent =
+                snapshot.occupancy.totalParkingCells === 0
+                    ? 0
+                    : snapshot.occupancy.occupiedCount / snapshot.occupancy.totalParkingCells;
+            snapshot.occupancy.effectiveOccupancyPercent =
+                snapshot.occupancy.totalParkingCells === 0
+                    ? 0
+                    : snapshot.occupancy.effectiveOccupiedCount / snapshot.occupancy.totalParkingCells;
+        }
+        currentElevatorDestination(operations) {
+            const move = operations.find((operation) => operation.type === "MoveElevator");
+            const destination = move ? elevatorPosition(move.to) : null;
+            return destination ?? undefined;
+        }
+        rememberFrame(time, frame) {
+            this.cache.set(time, frame);
+            while (this.cache.size > frameCacheMaxEntries) {
+                const firstKey = this.cache.keys().next().value;
+                if (firstKey === undefined)
+                    return;
+                this.cache.delete(firstKey);
+            }
+        }
+    }
+    class CanvasPhysicalStateRenderer {
+        constructor() {
+            this.canvas = null;
+        }
+        render(container, frame, garage) {
+            const geometry = this.buildGeometry(Math.max(720, Math.floor(container.clientWidth || 960)), garage.layout, frame.snapshot.preparationPositions);
+            const canvas = this.ensureCanvas(container);
+            const context = canvas.getContext("2d");
+            if (!context)
+                return;
+            this.sizeCanvas(canvas, context, geometry);
+            this.drawBackground(context, geometry);
+            this.drawFloors(context, geometry, garage.layout);
+            this.drawStreet(context, geometry, frame.snapshot);
+            this.drawPlannedPaths(context, geometry, frame);
+            this.drawPreparationPositionFrames(context, geometry, frame.snapshot);
+            this.drawMovingVmrs(context, geometry, frame);
+            this.drawElevatorDecks(context, geometry, frame);
+            this.drawParkedVehicles(context, geometry, frame);
+            this.drawReservedDestinations(context, geometry, frame);
+            this.drawPreparationPositionVehicles(context, geometry, frame.snapshot);
+            this.drawMovingVehicles(context, geometry, frame);
+        }
+        ensureCanvas(container) {
+            if (this.canvas && container.contains(this.canvas))
+                return this.canvas;
+            const existingCanvas = container.querySelector("canvas.garage-canvas");
+            if (existingCanvas) {
+                this.canvas = existingCanvas;
+                return existingCanvas;
+            }
+            const panel = document.createElement("section");
+            panel.className = "canvas-visualizer-panel";
+            panel.setAttribute("aria-label", "Physical garage canvas");
+            const canvas = document.createElement("canvas");
+            canvas.className = "garage-canvas";
+            panel.append(canvas);
+            container.replaceChildren(panel);
+            this.canvas = canvas;
+            return canvas;
+        }
+        sizeCanvas(canvas, context, geometry) {
+            const ratio = globalThis.devicePixelRatio || 1;
+            canvas.width = Math.ceil(geometry.width * ratio);
+            canvas.height = Math.ceil(geometry.height * ratio);
+            canvas.style.width = `${geometry.width}px`;
+            canvas.style.height = `${geometry.height}px`;
+            context.setTransform(ratio, 0, 0, ratio, 0, 0);
+        }
+        buildGeometry(availableWidth, layout, preparationPositions) {
+            const margin = 24;
+            const labelHeight = 28;
+            const floorGap = 34;
+            const streetGap = 14;
+            const cellWidthMeters = layout.streetFacing === "longSide" ? parkingCellLengthMeters : parkingCellWidthMeters;
+            const cellHeightMeters = layout.streetFacing === "longSide" ? parkingCellWidthMeters : parkingCellLengthMeters;
+            const floorWidthMeters = layout.columns * cellWidthMeters;
+            const floorHeightMeters = layout.rows * cellHeightMeters;
+            const scale = Math.max(12, Math.min(34, (availableWidth - margin * 2) / floorWidthMeters));
+            const longAxisHorizontal = layout.streetFacing === "longSide";
+            const vehicleSize = {
+                width: (longAxisHorizontal ? vehicleLengthMeters : vehicleWidthMeters) * scale,
+                height: (longAxisHorizontal ? vehicleWidthMeters : vehicleLengthMeters) * scale,
+            };
+            const perpendicularVehicleSize = {
+                width: (longAxisHorizontal ? vehicleWidthMeters : vehicleLengthMeters) * scale,
+                height: (longAxisHorizontal ? vehicleLengthMeters : vehicleWidthMeters) * scale,
+            };
+            const vmrSize = {
+                width: (longAxisHorizontal ? vmrLengthMeters : vmrWidthMeters) * scale,
+                height: (longAxisHorizontal ? vmrWidthMeters : vmrLengthMeters) * scale,
+            };
+            const streetHeight = Math.max(126, vehicleSize.height * 3 + 78);
+            const floorWidth = floorWidthMeters * scale;
+            const floorHeight = floorHeightMeters * scale;
+            const width = Math.ceil(Math.max(availableWidth, floorWidth + margin * 2));
+            const cellsById = new Map();
+            const elevatorByFloor = new Map();
+            const floors = new Map();
+            let y = margin;
+            let street = { x: margin, y: margin, width: floorWidth, height: streetHeight };
+            for (let floor = layout.floors; floor >= 1; floor -= 1) {
+                const floorRect = {
+                    x: margin,
+                    y: y + labelHeight,
+                    width: floorWidth,
+                    height: floorHeight,
+                };
+                floors.set(floor, floorRect);
+                for (let cellNumber = 1; cellNumber <= layout.rows * layout.columns; cellNumber += 1) {
+                    const row = Math.floor((cellNumber - 1) / layout.columns);
+                    const column = (cellNumber - 1) % layout.columns;
+                    const rect = {
+                        x: floorRect.x + column * cellWidthMeters * scale,
+                        y: floorRect.y + row * cellHeightMeters * scale,
+                        width: cellWidthMeters * scale,
+                        height: cellHeightMeters * scale,
+                    };
+                    const cellId = `f${floor}c${cellNumber}`;
+                    cellsById.set(cellId, rect);
+                    if (cellNumber === layout.elevatorCell)
+                        elevatorByFloor.set(floor, rect);
+                }
+                y += labelHeight + floorHeight;
+                if (floor === 1) {
+                    street = {
+                        x: margin,
+                        y: y + streetGap,
+                        width: floorWidth,
+                        height: streetHeight,
+                    };
+                    y += streetGap + streetHeight;
+                }
+                y += floorGap;
+            }
+            const inboundQueue = {
+                x: street.x + 12,
+                y: street.y + 36,
+                width: Math.max(180, street.width * 0.42),
+                height: street.height - 50,
+            };
+            const preparationRects = this.buildPreparationPositionRects(layout, cellsById, street, inboundQueue, preparationPositions);
+            return {
+                width,
+                height: Math.ceil(y),
+                scale,
+                vehicleSize,
+                perpendicularVehicleSize,
+                vmrSize,
+                floorWidth,
+                floorHeight,
+                cellsById,
+                elevatorByFloor,
+                floors,
+                street,
+                inboundQueue,
+                preparationPositions: preparationRects,
+            };
+        }
+        buildPreparationPositionRects(layout, cellsById, street, inboundQueue, positions) {
+            const result = new Map();
+            const firstFloorSlots = this.firstFloorPreparationPositionSlots(layout, cellsById);
+            if (firstFloorSlots.length > 0) {
+                positions.forEach((position, index) => {
+                    const slot = firstFloorSlots[index % firstFloorSlots.length];
+                    if (slot)
+                        result.set(position.id, slot);
+                });
+                return result;
+            }
+            const gap = 8;
+            const startX = inboundQueue.x + inboundQueue.width + 16;
+            const availableWidth = Math.max(160, street.x + street.width - startX - 12);
+            const columns = positions.length <= 2 ? positions.length || 1 : 2;
+            const rows = Math.max(1, Math.ceil(positions.length / columns));
+            const rectWidth = (availableWidth - gap * (columns - 1)) / columns;
+            const rectHeight = Math.min(42, (street.height - 50 - gap * (rows - 1)) / rows);
+            positions.forEach((position, index) => {
+                const column = index % columns;
+                const row = Math.floor(index / columns);
+                result.set(position.id, {
+                    x: startX + column * (rectWidth + gap),
+                    y: street.y + 36 + row * (rectHeight + gap),
+                    width: rectWidth,
+                    height: rectHeight,
+                });
+            });
+            return result;
+        }
+        firstFloorPreparationPositionSlots(layout, cellsById) {
+            if (layout.streetFacing !== "longSide" || layout.rows < 3 || layout.columns < 3) {
+                return [];
+            }
+            const left = unionRects(cellsById.get("f1c4"), cellsById.get("f1c7"));
+            const right = unionRects(cellsById.get("f1c6"), cellsById.get("f1c9"));
+            if (!left || !right)
+                return [];
+            return [leftHalf(left), rightHalf(left), leftHalf(right), rightHalf(right)];
+        }
+        drawBackground(context, geometry) {
+            context.clearRect(0, 0, geometry.width, geometry.height);
+            context.fillStyle = "#ffffff";
+            this.fillRoundedRect(context, 0, 0, geometry.width, geometry.height, 8);
+        }
+        drawFloors(context, geometry, layout) {
+            const unavailable = new Set([layout.elevatorCell, ...layout.unavailableCells]);
+            for (const [floor, floorRect] of geometry.floors) {
+                context.fillStyle = "#1f2a2e";
+                context.font = "700 15px Arial, Helvetica, sans-serif";
+                context.fillText(`Floor ${floor}`, floorRect.x, floorRect.y - 9);
+                context.fillStyle = "#627178";
+                context.font = "12px Arial, Helvetica, sans-serif";
+                context.fillText(`${formatMeters(geometry.floorWidth / geometry.scale)}m x ${formatMeters(geometry.floorHeight / geometry.scale)}m`, floorRect.x + 78, floorRect.y - 9);
+                context.strokeStyle = "#ccd7d4";
+                context.lineWidth = 1;
+                context.strokeRect(floorRect.x, floorRect.y, floorRect.width, floorRect.height);
+                for (let cellNumber = 1; cellNumber <= layout.rows * layout.columns; cellNumber += 1) {
+                    const rect = geometry.cellsById.get(`f${floor}c${cellNumber}`);
+                    if (!rect)
+                        continue;
+                    const isElevator = cellNumber === layout.elevatorCell;
+                    const isUnavailable = unavailable.has(cellNumber);
+                    context.fillStyle = isElevator ? "#e7ecef" : isUnavailable ? "#eef0ef" : "#fbfcfc";
+                    context.fillRect(rect.x, rect.y, rect.width, rect.height);
+                    context.strokeStyle = isElevator ? "#7d8f99" : "#d7dfdc";
+                    context.strokeRect(rect.x, rect.y, rect.width, rect.height);
+                    context.fillStyle = "#627178";
+                    context.font = "11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+                    context.fillText(`c${cellNumber}`, rect.x + 5, rect.y + 14);
+                    if (isElevator) {
+                        context.fillStyle = "#50636c";
+                        context.font = "700 11px Arial, Helvetica, sans-serif";
+                        context.fillText("Elevator", rect.x + 5, rect.y + rect.height - 8);
+                    }
+                }
+            }
+        }
+        drawStreet(context, geometry, snapshot) {
+            context.fillStyle = "#f6f8f7";
+            this.fillRoundedRect(context, geometry.street.x, geometry.street.y, geometry.street.width, geometry.street.height, 8);
+            context.strokeStyle = "#d7dfdc";
+            context.strokeRect(geometry.street.x, geometry.street.y, geometry.street.width, geometry.street.height);
+            context.fillStyle = "#1f2a2e";
+            context.font = "700 14px Arial, Helvetica, sans-serif";
+            context.fillText("Street Level", geometry.street.x + 12, geometry.street.y + 22);
+            this.drawLabeledBox(context, geometry.inboundQueue, "Inbound Queue", "#eef4f2");
+            const vehicleStepX = geometry.vehicleSize.width + 10;
+            const vehicleStepY = geometry.vehicleSize.height + 10;
+            const queueColumns = Math.max(1, Math.floor((geometry.inboundQueue.width - 20) / vehicleStepX));
+            snapshot.queues.inbound.slice(0, 12).forEach((vehicle, index) => {
+                const center = {
+                    x: geometry.inboundQueue.x + 10 + geometry.vehicleSize.width / 2 + (index % queueColumns) * vehicleStepX,
+                    y: geometry.inboundQueue.y + 30 + geometry.vehicleSize.height / 2 + Math.floor(index / queueColumns) * vehicleStepY,
+                };
+                this.drawVehicle(context, this.vehicleRectAt(center, geometry), vehicle.vehicleId, "#14343d");
+            });
+            if (snapshot.queues.inbound.length > 12) {
+                context.fillStyle = "#627178";
+                context.font = "12px Arial, Helvetica, sans-serif";
+                context.fillText(`+${snapshot.queues.inbound.length - 12} more`, geometry.inboundQueue.x + 10, geometry.inboundQueue.y + geometry.inboundQueue.height - 10);
+            }
+        }
+        drawPreparationPositionFrames(context, geometry, snapshot) {
+            for (const position of snapshot.preparationPositions) {
+                const rect = geometry.preparationPositions.get(position.id);
+                if (!rect)
+                    continue;
+                context.fillStyle = position.direction === "inbound" ? "#fff34a" : "#ffef65";
+                context.fillRect(rect.x, rect.y, rect.width, rect.height);
+                context.strokeStyle = "#1f2a2e";
+                context.lineWidth = 1;
+                context.strokeRect(rect.x, rect.y, rect.width, rect.height);
+                context.fillStyle = "#1f2a2e";
+                context.font = "700 11px Arial, Helvetica, sans-serif";
+                this.drawStackedText(context, physicalPreparationPositionLabel(position), rect.x + 9, rect.y + 20, 15);
+                context.font = "10px Arial, Helvetica, sans-serif";
+                context.fillText(position.doorState ?? "unknown", rect.x + 6, rect.y + rect.height - 6);
+            }
+        }
+        drawPreparationPositionVehicles(context, geometry, snapshot) {
+            for (const position of snapshot.preparationPositions) {
+                if (!position.occupiedBy)
+                    continue;
+                const rect = geometry.preparationPositions.get(position.id);
+                if (!rect)
+                    continue;
+                this.drawVehicle(context, this.vehicleRectAt(rectCenter(rect), geometry, "perpendicular"), position.occupiedBy, "#14343d");
+            }
+        }
+        drawPlannedPaths(context, geometry, frame) {
+            frame.interpolatedOperations.forEach((item, index) => {
+                const points = this.polylineForOperation(geometry, item.operation);
+                if (points.length < 2)
+                    return;
+                const color = index % 2 === 0 ? "#c18622" : "#0f7a6c";
+                context.save();
+                context.strokeStyle = color;
+                context.fillStyle = color;
+                context.lineWidth = 3;
+                context.setLineDash([8, 6]);
+                context.beginPath();
+                context.moveTo(points[0]?.x ?? 0, points[0]?.y ?? 0);
+                for (const point of points.slice(1))
+                    context.lineTo(point.x, point.y);
+                context.stroke();
+                context.setLineDash([]);
+                this.drawArrowHead(context, points[points.length - 2], points[points.length - 1], color);
+                const last = points[points.length - 1];
+                if (last) {
+                    context.font = "700 11px Arial, Helvetica, sans-serif";
+                    context.fillText(`${deckLabel(item.operation)} dest`, last.x + 6, last.y - 6);
+                }
+                context.restore();
+            });
+        }
+        drawParkedVehicles(context, geometry, frame) {
+            const movingVehicles = this.movingVehicleIds(frame);
+            for (const occupancy of frame.snapshot.occupancy.occupied) {
+                if (movingVehicles.has(occupancy.vehicleId))
+                    continue;
+                const rect = geometry.cellsById.get(occupancy.cellId);
+                if (!rect)
+                    continue;
+                this.drawVehicle(context, this.vehicleRectAt(rectCenter(rect), geometry), occupancy.vehicleId, "#14343d");
+            }
+        }
+        drawReservedDestinations(context, geometry, frame) {
+            const occupied = new Set(frame.snapshot.occupancy.occupied.map((cell) => cell.cellId));
+            for (const reservation of frame.snapshot.occupancy.reservations ?? []) {
+                if (occupied.has(reservation.cellId))
+                    continue;
+                const rect = geometry.cellsById.get(reservation.cellId);
+                if (!rect)
+                    continue;
+                const vehicleRect = this.vehicleRectAt(rectCenter(rect), geometry);
+                context.save();
+                context.strokeStyle = "#a13a31";
+                context.lineWidth = 2;
+                context.setLineDash([6, 4]);
+                context.strokeRect(vehicleRect.x, vehicleRect.y, vehicleRect.width, vehicleRect.height);
+                context.setLineDash([]);
+                context.fillStyle = "#a13a31";
+                context.font = "700 10px Arial, Helvetica, sans-serif";
+                context.fillText(`R ${shortId(reservation.vehicleId)}`, vehicleRect.x + 5, vehicleRect.y + 14);
+                context.restore();
+            }
+        }
+        drawElevatorDecks(context, geometry, frame) {
+            const movingVehicles = this.movingVehicleIds(frame);
+            const activeVmrDeckIndexes = this.activeVmrDeckIndexes(frame);
+            const decksByFloor = groupDecksByFloor(frame.snapshot.elevator.decks ?? []);
+            for (const [floor, decks] of decksByFloor) {
+                const shaft = geometry.elevatorByFloor.get(floor);
+                if (!shaft)
+                    continue;
+                decks.forEach((deck, index) => {
+                    const deckRect = insetRectByPixels(shaft, 5 + index * 2, 18 + index * 2);
+                    context.fillStyle = "rgba(255, 255, 255, 0.68)";
+                    this.fillRoundedRect(context, deckRect.x, deckRect.y, deckRect.width, deckRect.height, 5);
+                    context.strokeStyle = "#7d8f99";
+                    context.strokeRect(deckRect.x, deckRect.y, deckRect.width, deckRect.height);
+                    context.fillStyle = "#1f2a2e";
+                    context.font = "700 11px Arial, Helvetica, sans-serif";
+                    context.fillText(deck.id, deckRect.x + 5, deckRect.y + 13);
+                    context.fillStyle = "#627178";
+                    context.font = "10px Arial, Helvetica, sans-serif";
+                    context.fillText(deck.vmrId, deckRect.x + 5, deckRect.y + deckRect.height - 6);
+                    if (!activeVmrDeckIndexes.has(deck.index)) {
+                        this.drawVmr(context, this.vmrRectAt(rectCenter(shaft), geometry), deck.vmrId);
+                    }
+                    if (deck.vehicleId && !movingVehicles.has(deck.vehicleId)) {
+                        this.drawVehicle(context, this.vehicleRectAt(rectCenter(shaft), geometry), deck.vehicleId, deck.vehicleRole === "outbound" ? "#87352f" : "#14343d");
+                    }
+                });
+            }
+        }
+        drawMovingVmrs(context, geometry, frame) {
+            for (const item of frame.interpolatedOperations) {
+                const points = this.polylineForOperation(geometry, item.operation);
+                if (points.length < 2)
+                    continue;
+                const sample = samplePolyline(points, item.progress);
+                const deck = deckLabel(item.operation);
+                this.drawVmr(context, this.vmrRectAt(sample.point, geometry), deck);
+                context.fillStyle = "#1f2a2e";
+                context.font = "700 11px Arial, Helvetica, sans-serif";
+                context.fillText(`${deck} ${Math.round(item.progress * 100)}%`, sample.point.x + 12, sample.point.y - 12);
+            }
+        }
+        drawMovingVehicles(context, geometry, frame) {
+            for (const item of frame.interpolatedOperations) {
+                const points = this.polylineForOperation(geometry, item.operation);
+                if (points.length < 2)
+                    continue;
+                const sample = samplePolyline(points, item.progress);
+                if (item.operation.vehicleId && carriesVehicle(item.operation.type)) {
+                    this.drawVehicle(context, this.vehicleRectAt({
+                        x: sample.point.x,
+                        y: sample.point.y - geometry.vmrSize.height * 0.18,
+                    }, geometry), item.operation.vehicleId, "#87352f");
+                }
+            }
+        }
+        polylineForOperation(geometry, operation) {
+            const rawLocations = operation.path && operation.path.locations.length > 0
+                ? operation.path.locations
+                : operation.path?.cells ?? [];
+            const points = [];
+            for (const location of rawLocations) {
+                const point = this.pointForLocation(geometry, location);
+                if (!point)
+                    continue;
+                const previous = points[points.length - 1];
+                if (previous && previous.x === point.x && previous.y === point.y)
+                    continue;
+                points.push(point);
+            }
+            return points;
+        }
+        pointForLocation(geometry, location) {
+            const cell = geometry.cellsById.get(location);
+            if (cell)
+                return rectCenter(cell);
+            const elevatorMatch = location.match(/^f(\d+):elevator$/);
+            if (elevatorMatch?.[1]) {
+                const elevator = geometry.elevatorByFloor.get(Number(elevatorMatch[1]));
+                return elevator ? rectCenter(elevator) : null;
+            }
+            return null;
+        }
+        movingVehicleIds(frame) {
+            const result = new Set();
+            for (const item of frame.interpolatedOperations) {
+                if (item.operation.vehicleId && item.operation.path && carriesVehicle(item.operation.type)) {
+                    result.add(item.operation.vehicleId);
+                }
+            }
+            return result;
+        }
+        activeVmrDeckIndexes(frame) {
+            const result = new Set();
+            for (const item of frame.interpolatedOperations) {
+                const deckIndex = operationDeckIndex(item.operation);
+                if (deckIndex !== null && item.operation.path && item.operation.type !== "RotateDeck") {
+                    result.add(deckIndex);
+                }
+            }
+            return result;
+        }
+        drawLabeledBox(context, rect, label, fill) {
+            context.fillStyle = fill;
+            this.fillRoundedRect(context, rect.x, rect.y, rect.width, rect.height, 6);
+            context.strokeStyle = "#d7dfdc";
+            context.strokeRect(rect.x, rect.y, rect.width, rect.height);
+            context.fillStyle = "#1f2a2e";
+            context.font = "700 12px Arial, Helvetica, sans-serif";
+            context.fillText(label, rect.x + 8, rect.y + 15);
+        }
+        drawVehicle(context, rect, vehicleId, color) {
+            context.fillStyle = color;
+            this.fillRoundedRect(context, rect.x, rect.y, rect.width, rect.height, 5);
+            context.fillStyle = "#ffffff";
+            context.font = "700 10px Arial, Helvetica, sans-serif";
+            context.fillText(`V ${shortId(vehicleId)}`, rect.x + 5, rect.y + Math.min(rect.height - 5, 14));
+        }
+        drawVmr(context, rect, label) {
+            context.fillStyle = "#0f7a6c";
+            this.fillRoundedRect(context, rect.x, rect.y, rect.width, rect.height, 5);
+            context.strokeStyle = "#ffffff";
+            context.lineWidth = 2;
+            context.strokeRect(rect.x, rect.y, rect.width, rect.height);
+            context.fillStyle = "#ffffff";
+            context.font = "700 10px Arial, Helvetica, sans-serif";
+            context.fillText(label, rect.x + 5, rect.y + Math.min(rect.height - 5, 14));
+        }
+        vehicleRectAt(center, geometry, orientation = "parking") {
+            const size = orientation === "perpendicular"
+                ? geometry.perpendicularVehicleSize
+                : geometry.vehicleSize;
+            return rectFromCenter(center, size.width, size.height);
+        }
+        vmrRectAt(center, geometry) {
+            return rectFromCenter(center, geometry.vmrSize.width, geometry.vmrSize.height);
+        }
+        drawArrowHead(context, from, to, color) {
+            if (!from || !to)
+                return;
+            const angle = Math.atan2(to.y - from.y, to.x - from.x);
+            const size = 9;
+            context.fillStyle = color;
+            context.beginPath();
+            context.moveTo(to.x, to.y);
+            context.lineTo(to.x - size * Math.cos(angle - Math.PI / 6), to.y - size * Math.sin(angle - Math.PI / 6));
+            context.lineTo(to.x - size * Math.cos(angle + Math.PI / 6), to.y - size * Math.sin(angle + Math.PI / 6));
+            context.closePath();
+            context.fill();
+        }
+        fillRoundedRect(context, x, y, width, height, radius) {
+            const r = Math.min(radius, width / 2, height / 2);
+            context.beginPath();
+            context.moveTo(x + r, y);
+            context.lineTo(x + width - r, y);
+            context.quadraticCurveTo(x + width, y, x + width, y + r);
+            context.lineTo(x + width, y + height - r);
+            context.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+            context.lineTo(x + r, y + height);
+            context.quadraticCurveTo(x, y + height, x, y + height - r);
+            context.lineTo(x, y + r);
+            context.quadraticCurveTo(x, y, x + r, y);
+            context.closePath();
+            context.fill();
+        }
+        drawStackedText(context, text, x, y, lineHeight) {
+            [...text].forEach((char, index) => {
+                context.fillText(char, x, y + index * lineHeight);
+            });
+        }
+    }
+    class HtmlComputationalStateRenderer {
+        render(container, frame, config) {
+            const snapshot = frame.snapshot;
+            const active = snapshot.activeOperations;
+            container.innerHTML = `
+      <section class="state-panel">
+        <h2>Simulation State</h2>
+        <dl class="state-list">
+          <div><dt>Scenario</dt><dd>${escapeHtml(config.simulation.sessionName)}</dd></div>
+          <div><dt>Time</dt><dd>${formatDuration(frame.time)}</dd></div>
+          <div><dt>Occupancy</dt><dd>${snapshot.occupancy.occupiedCount} / ${snapshot.occupancy.totalParkingCells}</dd></div>
+          <div><dt>Reserved Cells</dt><dd>${snapshot.occupancy.reservedCount ?? 0}</dd></div>
+          <div><dt>Effective Occupancy</dt><dd>${snapshot.occupancy.effectiveOccupiedCount ?? snapshot.occupancy.occupiedCount} / ${snapshot.occupancy.totalParkingCells}</dd></div>
+          <div><dt>Inbound Queue</dt><dd>${snapshot.queues.inboundLength}</dd></div>
+          <div><dt>Outbound Queue</dt><dd>${snapshot.queues.outboundLength}</dd></div>
+          <div><dt>Elevator</dt><dd>floor ${snapshot.elevator.currentFloor}, ${escapeHtml(snapshot.elevator.direction ?? "stopped")}</dd></div>
+          <div><dt>Elevator Destination</dt><dd>${frame.elevatorDestination === undefined ? "none" : `floor ${frame.elevatorDestination}`}</dd></div>
+        </dl>
+      </section>
+      <section class="state-panel">
+        <h2>Outbound Queue</h2>
+        <div class="compact-queue">${snapshot.queues.outbound.length === 0 ? "<span class=\"muted-text\">Empty</span>" : snapshot.queues.outbound.map((item) => `<span>V ${escapeHtml(item.vehicleId)} <small>@ ${formatDuration(item.queuedAt)}</small></span>`).join("")}</div>
+      </section>
+      <section class="state-panel">
+        <h2>Active Operations</h2>
+        ${active.length === 0 ? "<p class=\"muted-text\">No active operations.</p>" : `<div class="operation-list">${frame.interpolatedOperations.map((item) => this.renderOperation(item)).join("")}</div>`}
+      </section>
+      <section class="state-panel">
+        <h2>Trip And Counters</h2>
+        <dl class="state-list">
+          <div><dt>Trip Phase</dt><dd>${escapeHtml(snapshot.elevator.activeTrip?.phase ?? "none")}</dd></div>
+          <div><dt>Trip Route</dt><dd>${snapshot.elevator.activeTrip?.route.join(" -> ") ?? "none"}</dd></div>
+          <div><dt>Inbound Completed</dt><dd>${snapshot.counters.inboundCompleted}</dd></div>
+          <div><dt>Outbound Completed</dt><dd>${snapshot.counters.outboundCompleted}</dd></div>
+          <div><dt>VMR Distance</dt><dd>${Math.round(snapshot.counters.vmrDistanceMeters)} m</dd></div>
+        </dl>
+      </section>
+    `;
+        }
+        renderOperation(item) {
+            const operation = item.operation;
+            return `
+      <div class="operation-item">
+        <strong>${escapeHtml(operation.type)}${operation.vehicleId ? `, V ${escapeHtml(operation.vehicleId)}` : ""}</strong>
+        <span>${escapeHtml(operation.from ?? "unknown")} -> ${escapeHtml(operation.to ?? "unknown")}</span>
+        <progress max="1" value="${item.progress.toFixed(3)}"></progress>
+        <small>${Math.round(item.progress * 100)}%${item.currentLocation ? `, now ${escapeHtml(item.currentLocation)}` : ""}</small>
+      </div>
+    `;
+        }
+    }
+    function buildActivePathIndex(operations) {
+        const result = new Map();
+        for (const item of operations) {
+            const path = item.operation.path;
+            if (!path)
+                continue;
+            const label = `${deckLabel(item.operation)}${item.operation.vehicleId ? ` V${item.operation.vehicleId}` : ""}`;
+            for (const cell of path.cells) {
+                const entry = ensurePathEntry(result, cell);
+                entry.path.push(label);
+            }
+            if (item.currentLocation?.startsWith("f")) {
+                ensurePathEntry(result, item.currentLocation).current.push(label);
+            }
+            if (item.destination?.startsWith("f")) {
+                ensurePathEntry(result, item.destination).destination.push(`to ${label}`);
+            }
+        }
+        return result;
+    }
+    function groupDecksByFloor(decks) {
+        const result = new Map();
+        for (const deck of decks) {
+            const list = result.get(deck.alignedFloor) ?? [];
+            list.push(deck);
+            result.set(deck.alignedFloor, list);
+        }
+        return result;
+    }
+    function ensurePathEntry(map, cellId) {
+        const existing = map.get(cellId);
+        if (existing)
+            return existing;
+        const entry = { path: [], current: [], destination: [] };
+        map.set(cellId, entry);
+        return entry;
+    }
+    function interpolateOperation(operation, time) {
+        const duration = Math.max(1, operation.completesAt - operation.startedAt);
+        const progress = clamp((time - operation.startedAt) / duration, 0, 1);
+        const pathLocation = pathLocationAt(operation.path, progress);
+        return {
+            operation,
+            progress,
+            ...(pathLocation.current ? { currentLocation: pathLocation.current } : {}),
+            ...(pathLocation.destination ? { destination: pathLocation.destination } : {}),
+        };
+    }
+    function pathLocationAt(path, progress) {
+        if (!path || path.locations.length === 0)
+            return {};
+        const lastIndex = path.locations.length - 1;
+        const index = Math.min(lastIndex, Math.max(0, Math.floor(progress * lastIndex)));
+        return {
+            ...(path.locations[index] ? { current: path.locations[index] } : {}),
+            ...(path.locations[lastIndex] ? { destination: path.locations[lastIndex] } : {}),
+        };
+    }
+    function samplePolyline(points, progress) {
+        if (points.length === 0) {
+            const origin = { x: 0, y: 0 };
+            return { point: origin, previous: origin, next: origin };
+        }
+        if (points.length === 1) {
+            const only = points[0] ?? { x: 0, y: 0 };
+            return { point: only, previous: only, next: only };
+        }
+        const segmentLengths = [];
+        let totalLength = 0;
+        for (let index = 0; index < points.length - 1; index += 1) {
+            const from = points[index];
+            const to = points[index + 1];
+            if (!from || !to)
+                continue;
+            const length = distance(from, to);
+            segmentLengths.push(length);
+            totalLength += length;
+        }
+        if (totalLength === 0) {
+            const first = points[0] ?? { x: 0, y: 0 };
+            return { point: first, previous: first, next: first };
+        }
+        let remaining = clamp(progress, 0, 1) * totalLength;
+        for (let index = 0; index < segmentLengths.length; index += 1) {
+            const length = segmentLengths[index] ?? 0;
+            const from = points[index];
+            const to = points[index + 1];
+            if (!from || !to)
+                continue;
+            if (remaining <= length || index === segmentLengths.length - 1) {
+                const localProgress = length === 0 ? 0 : remaining / length;
+                return {
+                    point: {
+                        x: from.x + (to.x - from.x) * localProgress,
+                        y: from.y + (to.y - from.y) * localProgress,
+                    },
+                    previous: from,
+                    next: to,
+                };
+            }
+            remaining -= length;
+        }
+        const last = points[points.length - 1] ?? { x: 0, y: 0 };
+        const previous = points[points.length - 2] ?? last;
+        return { point: last, previous, next: last };
+    }
+    function distance(from, to) {
+        return Math.hypot(to.x - from.x, to.y - from.y);
+    }
+    function rectCenter(rect) {
+        return {
+            x: rect.x + rect.width / 2,
+            y: rect.y + rect.height / 2,
+        };
+    }
+    function rectFromCenter(center, width, height) {
+        return {
+            x: center.x - width / 2,
+            y: center.y - height / 2,
+            width,
+            height,
+        };
+    }
+    function insetRectByPixels(rect, xInset, yInset) {
+        return {
+            x: rect.x + xInset,
+            y: rect.y + yInset,
+            width: Math.max(8, rect.width - xInset * 2),
+            height: Math.max(8, rect.height - yInset * 2),
+        };
+    }
+    function unionRects(a, b) {
+        if (!a || !b)
+            return null;
+        const x = Math.min(a.x, b.x);
+        const y = Math.min(a.y, b.y);
+        const right = Math.max(a.x + a.width, b.x + b.width);
+        const bottom = Math.max(a.y + a.height, b.y + b.height);
+        return {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        };
+    }
+    function leftHalf(rect) {
+        return {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width / 2,
+            height: rect.height,
+        };
+    }
+    function rightHalf(rect) {
+        return {
+            x: rect.x + rect.width / 2,
+            y: rect.y,
+            width: rect.width / 2,
+            height: rect.height,
+        };
+    }
+    function physicalPreparationPositionLabel(position) {
+        const number = Number(/\d+$/.exec(position.id)?.[0] ?? 1);
+        if (position.id.startsWith("IPP"))
+            return `PP${5 - number}`;
+        if (position.id.startsWith("OPP"))
+            return `PP${3 - number}`;
+        return position.id.replace(/^P/, "PP");
+    }
+    function carriesVehicle(type) {
+        return (type === "ParkInbound" ||
+            type === "LoadOutbound" ||
+            type === "MoveBlocker" ||
+            type === "RelocateBlocker" ||
+            type === "IdleUnblock");
+    }
+    function shortId(id) {
+        return id.length <= 8 ? id : id.slice(-8);
+    }
+    function formatMeters(value) {
+        return Number.isInteger(value) ? String(value) : value.toFixed(1);
+    }
+    function operationDeckIndex(operation) {
+        return parseDeckIndex(operation.from) ?? parseDeckIndex(operation.to);
+    }
+    function deckByLocation(decks, location) {
+        const index = parseDeckIndex(location);
+        return index === null ? undefined : decks[index];
+    }
+    function parseDeckIndex(location) {
+        if (!location?.startsWith("D"))
+            return null;
+        const value = Number(location.slice(1));
+        return Number.isFinite(value) && value >= 1 ? value - 1 : null;
+    }
+    function deckLabel(operation) {
+        const index = operationDeckIndex(operation);
+        return index === null ? "VMR" : `D${index + 1}`;
+    }
+    function elevatorPosition(location) {
+        if (!location?.startsWith("elevator-position-"))
+            return null;
+        const value = Number(location.slice("elevator-position-".length));
+        return Number.isFinite(value) ? value : null;
+    }
+    function inferDeckFromRotateGroup(decks, group) {
+        if (!group)
+            return undefined;
+        const match = group.match(/D(\d+)/i);
+        if (!match?.[1])
+            return undefined;
+        const index = Number(match[1]) - 1;
+        return decks[index];
+    }
+    function reserveDestinationForOperation(snapshot, operation) {
+        if (!isCellReservationPurpose(operation.type) || !operation.vehicleId || !operation.to?.startsWith("f")) {
+            return;
+        }
+        const reservation = {
+            cellId: operation.to,
+            vehicleId: operation.vehicleId,
+            operationId: operation.id,
+            reservedAt: operation.startedAt,
+            expectedOccupiedAt: operation.completesAt,
+            purpose: operation.type,
+        };
+        const existing = snapshot.occupancy.reservations ?? [];
+        snapshot.occupancy.reservations = [
+            ...existing.filter((candidate) => candidate.cellId !== reservation.cellId &&
+                candidate.operationId !== reservation.operationId),
+            reservation,
+        ];
+    }
+    function releaseReservationForCompletedOperation(snapshot, operation) {
+        if (!isCellReservationPurpose(operation.type))
+            return;
+        const to = stringDetail(operation.detail, "to");
+        snapshot.occupancy.reservations = (snapshot.occupancy.reservations ?? []).filter((reservation) => reservation.cellId !== to &&
+            (!operation.vehicleId || reservation.vehicleId !== operation.vehicleId));
+    }
+    function isCellReservationPurpose(type) {
+        return (type === "ParkInbound" ||
+            type === "RelocateBlocker" ||
+            type === "IdleUnblock");
+    }
+    function removeOccupiedVehicle(snapshot, vehicleId) {
+        snapshot.occupancy.occupied = snapshot.occupancy.occupied.filter((cell) => cell.vehicleId !== vehicleId);
+    }
+    function upsertOccupied(snapshot, cell) {
+        snapshot.occupancy.occupied = snapshot.occupancy.occupied.filter((candidate) => candidate.vehicleId !== cell.vehicleId && candidate.cellId !== cell.cellId);
+        snapshot.occupancy.reservations = (snapshot.occupancy.reservations ?? []).filter((reservation) => reservation.vehicleId !== cell.vehicleId && reservation.cellId !== cell.cellId);
+        snapshot.occupancy.occupied.push(cell);
+    }
+    function clearDeck(deck) {
+        delete deck.vehicleId;
+        delete deck.vehicleRole;
+    }
+    function recordTime(record) {
+        return record.kind === "second" ? record.record.time : record.t;
+    }
+    function stringDetail(detail, key) {
+        const value = detail[key];
+        return typeof value === "string" ? value : undefined;
+    }
+    function cloneValue(value) {
+        if (typeof globalThis.structuredClone === "function") {
+            return globalThis.structuredClone(value);
+        }
+        return JSON.parse(JSON.stringify(value));
+    }
+    function requiredElement(root, selector, constructor) {
+        const element = root.querySelector(selector);
+        if (!(element instanceof constructor)) {
+            throw new Error(`Missing required visualizer element: ${selector}`);
+        }
+        return element;
+    }
+    function formatDuration(totalSeconds) {
+        const seconds = Math.max(0, Math.round(totalSeconds));
+        const days = Math.floor(seconds / 86400);
+        const hours = Math.floor((seconds % 86400) / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        const remaining = seconds % 60;
+        const clock = [hours, minutes, remaining].map((value) => String(value).padStart(2, "0")).join(":");
+        return days > 0 ? `day ${days + 1}, ${clock}` : clock;
+    }
+    function clamp(value, min, max) {
+        return Math.min(max, Math.max(min, value));
+    }
+    function escapeHtml(value) {
+        return value
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
     }
 });

@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Parking Tower Visualizer</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="visualizer-shell" data-visualizer-root>
+      <header class="topbar visualizer-topbar">
+        <div>
+          <h1>Parking Tower Visualizer</h1>
+          <p id="visualizer-status" data-state="normal">Ready.</p>
+        </div>
+        <div class="actions">
+          <a class="button-link" href="./index.html">Simulator</a>
+          <a class="button-link" href="./documentation.html" target="_blank" rel="noreferrer">Help</a>
+          <label class="file-button" for="raw-output-input">Load Raw Output</label>
+          <input id="raw-output-input" class="visually-hidden" type="file" accept=".jsonl,.json,application/json,text/plain">
+        </div>
+      </header>
+
+      <section class="visualizer-content">
+        <section class="physical-column" aria-label="Physical state and timeline">
+          <section id="physical-state-view" class="physical-view" aria-label="Physical state">
+            <div class="empty-state">Load a raw output file to view the garage state.</div>
+          </section>
+          <section class="timeline-panel" aria-label="Timeline controls">
+            <button id="play-button" type="button">Play</button>
+            <button id="pause-button" type="button">Pause</button>
+            <input id="time-slider" type="range" min="0" max="0" step="1" value="0">
+            <span id="time-readout">00:00:00</span>
+          </section>
+        </section>
+        <aside id="computational-state-view" class="computational-view" aria-label="Computational state">
+          <div class="empty-state">Queues, elevator destination, and active operations will appear here.</div>
+        </aside>
+      </section>
+    </main>
+
+    <script>
+      (function () {
+        const modules = {};
+        const cache = {};
+
+        window.define = function (name, deps, factory) {
+          modules[name] = { deps, factory };
+        };
+
+        window.require = function (deps, callback) {
+          const resolved = deps.map(load);
+          callback && callback.apply(null, resolved);
+        };
+
+        function load(name) {
+          if (cache[name]) return cache[name];
+          if (!modules[name]) throw new Error("Module not found: " + name);
+          const exports = {};
+          const module = { exports };
+          const resolved = modules[name].deps.map(function (dep) {
+            if (dep === "require") return window.require;
+            if (dep === "exports") return exports;
+            if (dep === "module") return module;
+            return load(resolveName(name, dep));
+          });
+          modules[name].factory.apply(null, resolved);
+          cache[name] = module.exports !== exports ? module.exports : exports;
+          return cache[name];
+        }
+
+        function resolveName(from, dep) {
+          if (!dep.startsWith(".")) return dep;
+          const parts = from.split("/");
+          parts.pop();
+          for (const part of dep.split("/")) {
+            if (part === "." || part === "") continue;
+            if (part === "..") parts.pop();
+            else parts.push(part);
+          }
+          return parts.join("/");
+        }
+      })();
+    </script>
+    <script src="./simulator.bundle.js"></script>
+    <script>
+      require(["browser/visualizer"], function (visualizer) {
+        visualizer.startVisualizer();
+      });
+    </script>
+  </body>
+</html>

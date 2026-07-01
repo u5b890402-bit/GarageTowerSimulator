@@ -2,6 +2,7 @@ import type {
   CapacityInfo,
   CellId,
   CellOccupancy,
+  CellReservation,
   ElevatorTripAction,
   ElevatorTripActionGroup,
   ElevatorDeckState,
@@ -77,6 +78,7 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
   private inboundQueue: QueuedVehicle[] = [];
   private outboundQueue: QueuedVehicle[] = [];
   private parked = new Map<VehicleId, ParkedVehicleRecord>();
+  private cellReservations = new Map<CellId, CellReservation>();
   private requestedOutbound = new Set<VehicleId>();
   private preparationPositions: PreparationPositionState[] = [];
   private decks: ElevatorDeckState[] = [];
@@ -101,6 +103,7 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
     this.inboundQueue = [];
     this.outboundQueue = [];
     this.parked.clear();
+    this.cellReservations.clear();
     this.requestedOutbound.clear();
     this.trip = null;
     this.elevatorFloor = 1;
@@ -577,7 +580,6 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
       this.elevatorDirection = group.elevatorDirection;
     }
     const operations = group.actions.map((action, index) => {
-      this.applyActionStart(action, context.time);
       const operation: GarageOperation = {
         id: `${this.trip?.state.id}-${this.trip?.groupIndex}-${index}`,
         type: action.type,
@@ -588,6 +590,7 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
         ...(action.to ? { to: action.to } : {}),
         ...(action.path ? { path: action.path } : {}),
       };
+      this.applyActionStart(action, context.time, operation);
       if (action.deckIndex !== undefined && action.type !== "RotateDeck") {
         this.startVmrTask(action.deckIndex, operation);
       }
@@ -657,19 +660,20 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
     this.trip = null;
   }
 
-  private applyActionStart(action: ElevatorTripAction, time: SimTime): void {
-    if (
-      action.type !== "OperateDoor" ||
-      !action.preparationPositionId ||
-      !action.doorFinalState
-    ) {
-      return;
+  private applyActionStart(
+    action: ElevatorTripAction,
+    time: SimTime,
+    operation: GarageOperation,
+  ): void {
+    this.reserveDestinationCell(action, time, operation);
+
+    if (action.type === "OperateDoor" && action.preparationPositionId && action.doorFinalState) {
+      const position = this.findPp(action.preparationPositionId);
+      if (!position) return;
+      position.doorState =
+        action.doorFinalState === "open" ? "opening" : "closing";
+      position.doorTransitionCompleteAt = time + action.durationSeconds;
     }
-    const position = this.findPp(action.preparationPositionId);
-    if (!position) return;
-    position.doorState =
-      action.doorFinalState === "open" ? "opening" : "closing";
-    position.doorTransitionCompleteAt = time + action.durationSeconds;
   }
 
   private applyActionComplete(action: ElevatorTripAction, time: SimTime): void {
@@ -743,6 +747,7 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
             cellId: action.to as CellId,
             parkedAt: time,
           });
+          this.releaseReservation(action.to as CellId);
         }
         if (action.deckIndex !== undefined) this.clearDeck(action.deckIndex);
         break;
@@ -753,6 +758,7 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
             cellId: action.to as CellId,
             parkedAt: time,
           });
+          this.releaseReservation(action.to as CellId);
           this.counters.inboundCompleted += 1;
           this.counters.downwardTripPlacements += 1;
         }
@@ -780,6 +786,7 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
             cellId: action.to as CellId,
             parkedAt: time,
           });
+          this.releaseReservation(action.to as CellId);
           this.counters.idleUnblockingActions += 1;
           this.counters.idleUnblockedVehicles += 1;
         }
@@ -947,6 +954,39 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
     return this.preparationPositions.find((position) => position.id === id);
   }
 
+  private reserveDestinationCell(
+    action: ElevatorTripAction,
+    time: SimTime,
+    operation: GarageOperation,
+  ): void {
+    if (!this.isCellReservationPurpose(action.type) || !action.vehicleId || !action.to?.startsWith("f")) {
+      return;
+    }
+    const cellId = action.to as CellId;
+    this.cellReservations.set(cellId, {
+      cellId,
+      vehicleId: action.vehicleId,
+      operationId: operation.id,
+      reservedAt: time,
+      expectedOccupiedAt: operation.completesAt,
+      purpose: action.type,
+    });
+  }
+
+  private releaseReservation(cellId: CellId): void {
+    this.cellReservations.delete(cellId);
+  }
+
+  private isCellReservationPurpose(
+    type: GarageOperation["type"],
+  ): type is CellReservation["purpose"] {
+    return (
+      type === "ParkInbound" ||
+      type === "RelocateBlocker" ||
+      type === "IdleUnblock"
+    );
+  }
+
   private taskDistance(from?: string, to?: string): number {
     const cell = [from, to].find((value) => value?.startsWith("f"));
     if (cell) {
@@ -974,13 +1014,27 @@ export class SimpleGarageTowerSystem implements GarageTowerSystem {
       vehicleId: record.vehicleId,
       parkedAt: record.parkedAt,
     }));
+    const reservations = [...this.cellReservations.values()].map((reservation) => ({
+      ...reservation,
+    }));
+    const reservedCellIds = new Set(
+      reservations
+        .filter((reservation) => !occupied.some((cell) => cell.cellId === reservation.cellId))
+        .map((reservation) => reservation.cellId),
+    );
     const totalParkingCells = this.layout.getParkingCells().length;
+    const effectiveOccupiedCount = occupied.length + reservedCellIds.size;
     return {
       occupied,
+      reservations,
       occupiedCount: occupied.length,
+      reservedCount: reservedCellIds.size,
+      effectiveOccupiedCount,
       totalParkingCells,
       occupancyPercent:
         totalParkingCells === 0 ? 0 : occupied.length / totalParkingCells,
+      effectiveOccupancyPercent:
+        totalParkingCells === 0 ? 0 : effectiveOccupiedCount / totalParkingCells,
     };
   }
 

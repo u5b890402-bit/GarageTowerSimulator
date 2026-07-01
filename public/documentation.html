@@ -15,12 +15,17 @@
           Use this guide to edit a simulation configuration, run scenarios, and understand the report output.
         </p>
       </div>
-      <a class="button-link" href="./index.html">Open Simulator</a>
+      <div class="actions">
+        <a class="button-link" href="./visualizer.html">Open Visualizer</a>
+        <a class="button-link" href="./index.html">Open Simulator</a>
+      </div>
     </header>
 
     <main class="docs-layout">
       <nav class="docs-nav" aria-label="Documentation sections">
         <a href="#quick-start">Quick Start</a>
+        <a href="#save-load">Save And Load</a>
+        <a href="#visualizer">Visualizer</a>
         <a href="#configuration">Configuration</a>
         <a href="#simulation">Simulation</a>
         <a href="#demand">Demand</a>
@@ -43,6 +48,46 @@
           <p>
             The browser app runs entirely inside the browser. The downloaded raw output is the detailed event log;
             the downloaded report is the easier file to read first.
+          </p>
+        </section>
+
+        <section id="save-load">
+          <h2>Save And Load Configurations</h2>
+          <p>
+            Use <strong>Save Config</strong> to download the current configuration as a JSON file. This is useful when
+            you have edited a scenario and want to keep it for later or share it with someone else.
+          </p>
+          <p>
+            Use <strong>Load Config File</strong> to choose a saved JSON configuration from your computer. The simulator
+            will put the file contents into the configuration editor and update the strategy dropdowns when the file is valid.
+          </p>
+          <ul class="plain-list">
+            <li>Save each scenario with a clear name, such as <code>3x3-long-stay.json</code>.</li>
+            <li>Use the same <code>seed</code> when you want two scenarios to use the same random demand pattern.</li>
+            <li>If a loaded file has an error, the app keeps the text in the editor so it can be fixed.</li>
+          </ul>
+        </section>
+
+        <section id="visualizer">
+          <h2>Visualizer</h2>
+          <p>
+            Use the visualizer to inspect a downloaded raw output file tick by tick. Open
+            <strong>Visualizer</strong>, choose <strong>Load Raw Output</strong>, then select a compact JSONL raw output
+            file from a simulation run.
+          </p>
+          <ul class="plain-list">
+            <li>The timeline slider selects the simulated second being displayed.</li>
+            <li><strong>Play</strong> advances at 20 simulated seconds per real second. Moving the slider pauses playback.</li>
+            <li>The physical view uses a canvas drawing of each floor, parked vehicles, elevator decks, preparation positions, and active VMR paths.</li>
+            <li>VMR paths are drawn as turning arrows, and moving VMRs with carried vehicles are interpolated along those paths.</li>
+            <li>Parking cells are scaled from the requirement dimensions of <code>6m x 3m</code> in the floor plan.</li>
+            <li>Reserved destination cells are drawn with a dashed red vehicle footprint until the vehicle is committed as parked.</li>
+            <li>The computational view shows the outbound queue, elevator destination, active operations, trip phase, and counters.</li>
+          </ul>
+          <p>
+            The visualizer replays compact raw output from periodic checkpoints. It keeps a small cache of nearby
+            reconstructed frames so scrubbing around the same time range remains responsive without keeping every second
+            of a long simulation in memory.
           </p>
         </section>
 

@@ -16,10 +16,11 @@ import type {
   UnblockingStrategy,
   VehicleId,
 } from "../domain/types.js";
+import { effectiveOccupiedCellIds } from "./occupancy.js";
 
 export class LowestCostPlacementStrategy implements PlacementStrategy {
   rankCandidateCells(context: PlacementContext): RankedCell[] {
-    const occupied = new Set(context.occupancy.occupied.map((cell) => cell.cellId));
+    const occupied = effectiveOccupiedCellIds(context.occupancy);
     return context.layout
       .getParkingCells()
       .filter((cellId) => !occupied.has(cellId))
@@ -39,7 +40,7 @@ export class LowestCostPlacementStrategy implements PlacementStrategy {
 
 export class FirstAvailablePlacementStrategy implements PlacementStrategy {
   rankCandidateCells(context: PlacementContext): RankedCell[] {
-    const occupied = new Set(context.occupancy.occupied.map((cell) => cell.cellId));
+    const occupied = effectiveOccupiedCellIds(context.occupancy);
     return context.layout
       .getParkingCells()
       .filter((cellId) => !occupied.has(cellId))

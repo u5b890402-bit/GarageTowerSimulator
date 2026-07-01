@@ -113,6 +113,9 @@ export function startApp(): void {
   const configInput = getElement<HTMLTextAreaElement>("config-input");
   const runButton = getElement<HTMLButtonElement>("run-button");
   const loadExampleButton = getElement<HTMLButtonElement>("load-example-button");
+  const loadConfigButton = getElement<HTMLButtonElement>("load-config-button");
+  const saveConfigButton = getElement<HTMLButtonElement>("save-config-button");
+  const configFileInput = getElement<HTMLInputElement>("config-file-input");
   const rawDownloadButton = getElement<HTMLButtonElement>("download-raw-button");
   const reportDownloadButton = getElement<HTMLButtonElement>("download-report-button");
 
@@ -123,6 +126,21 @@ export function startApp(): void {
     configInput.value = JSON.stringify(exampleConfig, null, 2);
     syncStrategyControlsFromConfig(configInput);
     setStatus("Example configuration loaded.");
+  });
+
+  loadConfigButton.addEventListener("click", () => {
+    configFileInput.click();
+  });
+
+  configFileInput.addEventListener("change", () => {
+    const file = configFileInput.files?.[0];
+    configFileInput.value = "";
+    if (!file) return;
+    void loadConfigFile(file, configInput);
+  });
+
+  saveConfigButton.addEventListener("click", () => {
+    saveCurrentConfig(configInput);
   });
 
   configInput.addEventListener("change", () => syncStrategyControlsFromConfig(configInput));
@@ -138,6 +156,51 @@ export function startApp(): void {
   reportDownloadButton.addEventListener("click", () => {
     if (latestRun) downloadText("parking-tower-report.json", latestRun.reportJson, "application/json");
   });
+}
+
+async function loadConfigFile(file: File, configInput: HTMLTextAreaElement): Promise<void> {
+  try {
+    const text = await file.text();
+    configInput.value = text;
+    const config = JSON.parse(text) as SimulationConfig;
+    const validation = validateSimulationConfig(config);
+    if (!validation.valid) {
+      syncStrategyControlsFromConfig(configInput);
+      throw new Error(validation.errors.join("\n"));
+    }
+    configInput.value = JSON.stringify(config, null, 2);
+    syncStrategyControlsFromConfig(configInput);
+    setStatus(`Configuration loaded: ${file.name}`);
+  } catch (error) {
+    setStatus(
+      `Configuration file loaded, but it needs attention:\n${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      true,
+    );
+  }
+}
+
+function saveCurrentConfig(configInput: HTMLTextAreaElement): void {
+  try {
+    const config = JSON.parse(configInput.value) as SimulationConfig;
+    const validation = validateSimulationConfig(config);
+    if (!validation.valid) {
+      throw new Error(validation.errors.join("\n"));
+    }
+    const filename = `${safeFilename(config.simulation.sessionName || "parking-tower-config")}.json`;
+    const text = JSON.stringify(config, null, 2);
+    configInput.value = text;
+    downloadText(filename, text, "application/json");
+    setStatus(`Configuration saved: ${filename}`);
+  } catch (error) {
+    setStatus(
+      `Configuration was not saved:\n${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      true,
+    );
+  }
 }
 
 function initializeStrategyControls(configInput: HTMLTextAreaElement): void {
@@ -282,6 +345,9 @@ function setControlsDisabled(disabled: boolean): void {
   for (const id of [
     "run-button",
     "load-example-button",
+    "load-config-button",
+    "save-config-button",
+    "config-file-input",
     "config-input",
     ...Object.values(strategyControlIds),
   ]) {
@@ -317,6 +383,14 @@ function downloadText(filename: string, text: string, mimeType: string): void {
   link.download = filename;
   link.click();
   URL.revokeObjectURL(url);
+}
+
+function safeFilename(value: string): string {
+  const cleaned = value
+    .trim()
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/^-+|-+$/g, "");
+  return cleaned || "parking-tower-config";
 }
 
 function yieldToBrowser(): Promise<void> {

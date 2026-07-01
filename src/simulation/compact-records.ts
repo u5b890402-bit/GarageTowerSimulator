@@ -71,8 +71,15 @@ function toStateRecord(record: SimulationSecondRecord): RawSimulationStateRecord
     t: record.time,
     occupancy: {
       occupiedCount: record.afterSnapshot.occupancy.occupiedCount,
+      reservedCount: record.afterSnapshot.occupancy.reservedCount ?? 0,
+      effectiveOccupiedCount:
+        record.afterSnapshot.occupancy.effectiveOccupiedCount ??
+        record.afterSnapshot.occupancy.occupiedCount,
       totalParkingCells: record.afterSnapshot.occupancy.totalParkingCells,
       occupancyPercent: record.afterSnapshot.occupancy.occupancyPercent,
+      effectiveOccupancyPercent:
+        record.afterSnapshot.occupancy.effectiveOccupancyPercent ??
+        record.afterSnapshot.occupancy.occupancyPercent,
     },
     queues: {
       inboundLength: record.afterSnapshot.queues.inboundLength,

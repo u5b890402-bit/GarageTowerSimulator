@@ -700,6 +700,9 @@ export class BaselineElevatorTripPlanner implements ElevatorTripPlanner {
     return {
       ...occupancy,
       occupied: occupancy.occupied.map((cell) => ({ ...cell })),
+      reservations: (occupancy.reservations ?? []).map((reservation) => ({
+        ...reservation,
+      })),
     };
   }
 
@@ -709,12 +712,11 @@ export class BaselineElevatorTripPlanner implements ElevatorTripPlanner {
     vehicleId: VehicleId,
     parkedAt: number,
   ): void {
+    occupancy.reservations = (occupancy.reservations ?? []).filter(
+      (reservation) => reservation.cellId !== cellId && reservation.vehicleId !== vehicleId,
+    );
     occupancy.occupied.push({ cellId, vehicleId, parkedAt });
-    occupancy.occupiedCount = occupancy.occupied.length;
-    occupancy.occupancyPercent =
-      occupancy.totalParkingCells === 0
-        ? 0
-        : occupancy.occupiedCount / occupancy.totalParkingCells;
+    this.recalculateOccupancyCounts(occupancy);
   }
 
   private removeVehicleFromOccupancy(
@@ -724,10 +726,27 @@ export class BaselineElevatorTripPlanner implements ElevatorTripPlanner {
     occupancy.occupied = occupancy.occupied.filter(
       (cell) => cell.vehicleId !== vehicleId,
     );
+    occupancy.reservations = (occupancy.reservations ?? []).filter(
+      (reservation) => reservation.vehicleId !== vehicleId,
+    );
+    this.recalculateOccupancyCounts(occupancy);
+  }
+
+  private recalculateOccupancyCounts(occupancy: OccupancyState): void {
     occupancy.occupiedCount = occupancy.occupied.length;
+    const occupiedCellIds = new Set(occupancy.occupied.map((cell) => cell.cellId));
+    const reservedCount = (occupancy.reservations ?? []).filter(
+      (reservation) => !occupiedCellIds.has(reservation.cellId),
+    ).length;
+    occupancy.reservedCount = reservedCount;
+    occupancy.effectiveOccupiedCount = occupancy.occupiedCount + reservedCount;
     occupancy.occupancyPercent =
       occupancy.totalParkingCells === 0
         ? 0
         : occupancy.occupiedCount / occupancy.totalParkingCells;
+    occupancy.effectiveOccupancyPercent =
+      occupancy.totalParkingCells === 0
+        ? 0
+        : occupancy.effectiveOccupiedCount / occupancy.totalParkingCells;
   }
 }

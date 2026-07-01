@@ -6,6 +6,7 @@ import type {
   LayoutConfig,
   OccupancyState,
 } from "../domain/types.js";
+import { effectiveOccupiedCellIds } from "./occupancy.js";
 
 export class GridGarageLayout implements GarageLayout {
   private readonly parkingCells: CellId[];
@@ -51,7 +52,7 @@ export class GridGarageLayout implements GarageLayout {
     const target = this.getCellGeometry(cellId);
     const centerRow = Math.ceil(this.config.rows / 2);
     const centerColumn = Math.ceil(this.config.columns / 2);
-    const occupied = new Set(occupancy.occupied.map((cell) => cell.cellId));
+    const occupied = effectiveOccupiedCellIds(occupancy);
     const horizontalFirst = this.buildPath(
       target.floor,
       centerRow,
@@ -83,7 +84,7 @@ export class GridGarageLayout implements GarageLayout {
       ],
       occupiedCount: occupancy.occupiedCount + 1,
     };
-    const occupied = new Set(candidateOccupancy.occupied.map((cell) => cell.cellId));
+    const occupied = effectiveOccupiedCellIds(candidateOccupancy);
     return this.parkingCells.some(
       (parkingCell) =>
         !occupied.has(parkingCell) &&

@@ -134,17 +134,21 @@ The browser app also links to:
 
 ```text
 public/documentation.html
+public/visualizer.html
 ```
 
 The browser app lets the user:
 
 - Load the example configuration.
+- Save the current configuration as a JSON file.
+- Load a saved configuration JSON file.
 - Select registered garage strategies from dropdowns.
 - Edit configuration JSON directly.
 - Run a simulation.
 - See a summary of key report metrics.
 - Download the compact raw JSONL output.
 - Download the generated JSON report.
+- Open the visualizer and load a raw JSONL output file to inspect the simulated garage state tick by tick.
 
 The browser build emits:
 
