@@ -3152,576 +3152,438 @@ define("browser/app", ["require", "exports", "config/validate-config", "garage/s
         return element;
     }
 });
-define("browser/visualizer", ["require", "exports"], function (require, exports) {
+define("browser/visualizer/types", ["require", "exports"], function (require, exports) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
-    exports.startVisualizer = startVisualizer;
-    const playbackSecondsPerSecond = 20;
-    const frameCacheMaxEntries = 360;
-    const parkingCellLengthMeters = 6;
-    const parkingCellWidthMeters = 3;
-    const vehicleLengthMeters = 5;
-    const vehicleWidthMeters = 2;
-    const vmrLengthMeters = 5.5;
-    const vmrWidthMeters = 2.5;
-    function startVisualizer() {
-        const root = document.querySelector("[data-visualizer-root]");
-        if (!root)
+    exports.vmrWidthMeters = exports.vmrLengthMeters = exports.vehicleWidthMeters = exports.vehicleLengthMeters = exports.parkingCellWidthMeters = exports.parkingCellLengthMeters = exports.frameCacheMaxEntries = exports.playbackSecondsPerSecond = void 0;
+    exports.playbackSecondsPerSecond = 20;
+    exports.frameCacheMaxEntries = 360;
+    exports.parkingCellLengthMeters = 6;
+    exports.parkingCellWidthMeters = 3;
+    exports.vehicleLengthMeters = 5;
+    exports.vehicleWidthMeters = 2;
+    exports.vmrLengthMeters = 5.5;
+    exports.vmrWidthMeters = 2.5;
+});
+define("browser/visualizer/operations", ["require", "exports"], function (require, exports) {
+    "use strict";
+    Object.defineProperty(exports, "__esModule", { value: true });
+    exports.buildActivePathIndex = buildActivePathIndex;
+    exports.groupDecksByFloor = groupDecksByFloor;
+    exports.ensurePathEntry = ensurePathEntry;
+    exports.interpolateOperation = interpolateOperation;
+    exports.pathLocationAt = pathLocationAt;
+    exports.physicalPreparationPositionLabel = physicalPreparationPositionLabel;
+    exports.carriesVehicle = carriesVehicle;
+    exports.shortId = shortId;
+    exports.formatMeters = formatMeters;
+    exports.operationDeckIndex = operationDeckIndex;
+    exports.deckByLocation = deckByLocation;
+    exports.parseDeckIndex = parseDeckIndex;
+    exports.deckLabel = deckLabel;
+    exports.elevatorPosition = elevatorPosition;
+    exports.inferDeckFromRotateGroup = inferDeckFromRotateGroup;
+    exports.reserveDestinationForOperation = reserveDestinationForOperation;
+    exports.releaseReservationForCompletedOperation = releaseReservationForCompletedOperation;
+    exports.isCellReservationPurpose = isCellReservationPurpose;
+    exports.recordTime = recordTime;
+    exports.stringDetail = stringDetail;
+    exports.cloneValue = cloneValue;
+    exports.formatDuration = formatDuration;
+    exports.clamp = clamp;
+    exports.escapeHtml = escapeHtml;
+    function buildActivePathIndex(operations) {
+        const result = new Map();
+        for (const item of operations) {
+            const path = item.operation.path;
+            if (!path)
+                continue;
+            const label = `${deckLabel(item.operation)}${item.operation.vehicleId ? ` V${item.operation.vehicleId}` : ""}`;
+            for (const cell of path.cells) {
+                const entry = ensurePathEntry(result, cell);
+                entry.path.push(label);
+            }
+            if (item.currentLocation?.startsWith("f")) {
+                ensurePathEntry(result, item.currentLocation).current.push(label);
+            }
+            if (item.destination?.startsWith("f")) {
+                ensurePathEntry(result, item.destination).destination.push(`to ${label}`);
+            }
+        }
+        return result;
+    }
+    function groupDecksByFloor(decks) {
+        const result = new Map();
+        for (const deck of decks) {
+            const list = result.get(deck.alignedFloor) ?? [];
+            list.push(deck);
+            result.set(deck.alignedFloor, list);
+        }
+        return result;
+    }
+    function ensurePathEntry(map, cellId) {
+        const existing = map.get(cellId);
+        if (existing)
+            return existing;
+        const entry = { path: [], current: [], destination: [] };
+        map.set(cellId, entry);
+        return entry;
+    }
+    function interpolateOperation(operation, time) {
+        const duration = Math.max(1, operation.completesAt - operation.startedAt);
+        const progress = clamp((time - operation.startedAt) / duration, 0, 1);
+        const pathLocation = pathLocationAt(operation.path, progress);
+        return {
+            operation,
+            progress,
+            ...(pathLocation.current ? { currentLocation: pathLocation.current } : {}),
+            ...(pathLocation.destination ? { destination: pathLocation.destination } : {}),
+        };
+    }
+    function pathLocationAt(path, progress) {
+        if (!path || path.locations.length === 0)
+            return {};
+        const lastIndex = path.locations.length - 1;
+        const index = Math.min(lastIndex, Math.max(0, Math.floor(progress * lastIndex)));
+        return {
+            ...(path.locations[index] ? { current: path.locations[index] } : {}),
+            ...(path.locations[lastIndex] ? { destination: path.locations[lastIndex] } : {}),
+        };
+    }
+    function physicalPreparationPositionLabel(position) {
+        const number = Number(/\d+$/.exec(position.id)?.[0] ?? 1);
+        if (position.id.startsWith("IPP"))
+            return `PP${5 - number}`;
+        if (position.id.startsWith("OPP"))
+            return `PP${3 - number}`;
+        return position.id.replace(/^P/, "PP");
+    }
+    function carriesVehicle(type) {
+        return (type === "ParkInbound" ||
+            type === "LoadOutbound" ||
+            type === "MoveBlocker" ||
+            type === "RelocateBlocker" ||
+            type === "IdleUnblock");
+    }
+    function shortId(id) {
+        return id.length <= 8 ? id : id.slice(-8);
+    }
+    function formatMeters(value) {
+        return Number.isInteger(value) ? String(value) : value.toFixed(1);
+    }
+    function operationDeckIndex(operation) {
+        return parseDeckIndex(operation.from) ?? parseDeckIndex(operation.to);
+    }
+    function deckByLocation(decks, location) {
+        const index = parseDeckIndex(location);
+        return index === null ? undefined : decks[index];
+    }
+    function parseDeckIndex(location) {
+        if (!location?.startsWith("D"))
+            return null;
+        const value = Number(location.slice(1));
+        return Number.isFinite(value) && value >= 1 ? value - 1 : null;
+    }
+    function deckLabel(operation) {
+        const index = operationDeckIndex(operation);
+        return index === null ? "VMR" : `D${index + 1}`;
+    }
+    function elevatorPosition(location) {
+        if (!location?.startsWith("elevator-position-"))
+            return null;
+        const value = Number(location.slice("elevator-position-".length));
+        return Number.isFinite(value) ? value : null;
+    }
+    function inferDeckFromRotateGroup(decks, group) {
+        if (!group)
+            return undefined;
+        const match = group.match(/D(\d+)/i);
+        if (!match?.[1])
+            return undefined;
+        const index = Number(match[1]) - 1;
+        return decks[index];
+    }
+    function reserveDestinationForOperation(snapshot, operation) {
+        if (!isCellReservationPurpose(operation.type) || !operation.vehicleId || !operation.to?.startsWith("f")) {
             return;
-        new BrowserVisualizerApp(root).start();
+        }
+        const reservation = {
+            cellId: operation.to,
+            vehicleId: operation.vehicleId,
+            operationId: operation.id,
+            reservedAt: operation.startedAt,
+            expectedOccupiedAt: operation.completesAt,
+            purpose: operation.type,
+        };
+        const existing = snapshot.occupancy.reservations ?? [];
+        snapshot.occupancy.reservations = [
+            ...existing.filter((candidate) => candidate.cellId !== reservation.cellId &&
+                candidate.operationId !== reservation.operationId),
+            reservation,
+        ];
     }
-    class BrowserVisualizerApp {
-        constructor(root) {
-            this.root = root;
-            this.dataSet = null;
-            this.replayEngine = null;
-            this.isPlaying = false;
-            this.lastAnimationTime = 0;
-            this.currentTime = 0;
-            this.animationHandle = 0;
-            this.loader = new JsonlVisualizerRawOutputLoader();
-            this.physicalRenderer = new CanvasPhysicalStateRenderer();
-            this.computationalRenderer = new HtmlComputationalStateRenderer();
-            this.fileInput = requiredElement(root, "#raw-output-input", HTMLInputElement);
-            this.status = requiredElement(root, "#visualizer-status", HTMLElement);
-            this.playButton = requiredElement(root, "#play-button", HTMLButtonElement);
-            this.pauseButton = requiredElement(root, "#pause-button", HTMLButtonElement);
-            this.slider = requiredElement(root, "#time-slider", HTMLInputElement);
-            this.timeReadout = requiredElement(root, "#time-readout", HTMLElement);
-            this.physicalView = requiredElement(root, "#physical-state-view", HTMLElement);
-            this.computationalView = requiredElement(root, "#computational-state-view", HTMLElement);
-        }
-        start() {
-            this.fileInput.addEventListener("change", () => void this.loadSelectedFile());
-            this.playButton.addEventListener("click", () => this.play());
-            this.pauseButton.addEventListener("click", () => this.pause());
-            this.slider.addEventListener("input", () => {
-                this.pause();
-                this.seek(Number(this.slider.value));
-            });
-            this.setControls(false);
-            this.setStatus("Select a raw JSONL output file to inspect.", "normal");
-        }
-        async loadSelectedFile() {
-            const file = this.fileInput.files?.[0];
-            if (!file)
-                return;
-            this.pause();
-            this.setStatus(`Loading ${file.name}...`, "normal");
-            try {
-                this.dataSet = await this.loader.load(file);
-                this.replayEngine = new CheckpointReplayEngine(this.dataSet);
-                this.currentTime = 0;
-                this.slider.min = "0";
-                this.slider.max = String(this.dataSet.durationSeconds);
-                this.slider.step = "1";
-                this.slider.value = "0";
-                this.setControls(true);
-                this.renderCurrentFrame();
-                this.setStatus(`Loaded ${file.name}. ${this.dataSet.records.length.toLocaleString()} records, ${this.dataSet.checkpoints.length.toLocaleString()} checkpoints.`, "normal");
-            }
-            catch (error) {
-                this.dataSet = null;
-                this.replayEngine = null;
-                this.setControls(false);
-                this.setStatus(error instanceof Error ? error.message : String(error), "error");
-            }
-        }
-        play() {
-            if (!this.replayEngine || this.isPlaying)
-                return;
-            this.isPlaying = true;
-            this.lastAnimationTime = performance.now();
-            this.animationHandle = requestAnimationFrame((timestamp) => this.advance(timestamp));
-            this.setControls(true);
-        }
-        pause() {
-            if (this.animationHandle) {
-                cancelAnimationFrame(this.animationHandle);
-                this.animationHandle = 0;
-            }
-            this.isPlaying = false;
-            this.setControls(Boolean(this.replayEngine));
-        }
-        advance(timestamp) {
-            if (!this.isPlaying || !this.dataSet)
-                return;
-            const elapsedSeconds = (timestamp - this.lastAnimationTime) / 1000;
-            this.lastAnimationTime = timestamp;
-            const nextTime = Math.min(this.dataSet.durationSeconds, this.currentTime + elapsedSeconds * playbackSecondsPerSecond);
-            this.seek(nextTime);
-            if (nextTime >= this.dataSet.durationSeconds) {
-                this.pause();
-                return;
-            }
-            this.animationHandle = requestAnimationFrame((nextTimestamp) => this.advance(nextTimestamp));
-        }
-        seek(time) {
-            if (!this.dataSet)
-                return;
-            this.currentTime = clamp(time, 0, this.dataSet.durationSeconds);
-            this.slider.value = String(Math.round(this.currentTime));
-            this.renderCurrentFrame();
-        }
-        renderCurrentFrame() {
-            if (!this.replayEngine || !this.dataSet)
-                return;
-            const frame = this.replayEngine.getFrameAt(Math.round(this.currentTime));
-            this.timeReadout.textContent = formatDuration(frame.time);
-            this.physicalRenderer.render(this.physicalView, frame, this.dataSet.metadata.config.garage);
-            this.computationalRenderer.render(this.computationalView, frame, this.dataSet.metadata.config);
-        }
-        setControls(enabled) {
-            this.playButton.disabled = !enabled || this.isPlaying;
-            this.pauseButton.disabled = !enabled || !this.isPlaying;
-            this.slider.disabled = !enabled;
-        }
-        setStatus(message, state) {
-            this.status.textContent = message;
-            this.status.dataset.state = state;
-        }
+    function releaseReservationForCompletedOperation(snapshot, operation) {
+        if (!isCellReservationPurpose(operation.type))
+            return;
+        const to = stringDetail(operation.detail, "to");
+        snapshot.occupancy.reservations = (snapshot.occupancy.reservations ?? []).filter((reservation) => reservation.cellId !== to &&
+            (!operation.vehicleId || reservation.vehicleId !== operation.vehicleId));
     }
-    class JsonlVisualizerRawOutputLoader {
-        async load(file) {
-            const text = await file.text();
-            const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
-            if (lines.length === 0)
-                throw new Error("The selected file is empty.");
-            let metadata = null;
-            const records = [];
-            const checkpoints = [];
-            for (let index = 0; index < lines.length; index += 1) {
-                const line = lines[index];
-                if (!line)
-                    continue;
-                let parsed;
-                try {
-                    parsed = JSON.parse(line);
-                }
-                catch (error) {
-                    throw new Error(`Line ${index + 1} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
-                }
-                if (parsed.kind === "metadata") {
-                    metadata = parsed;
-                    continue;
-                }
-                records.push(parsed);
-                if (parsed.kind === "checkpoint")
-                    checkpoints.push(parsed);
-            }
-            if (!metadata)
-                throw new Error("The raw output does not contain a metadata record.");
-            const loadedMetadata = metadata;
-            if (checkpoints.length === 0)
-                throw new Error("The raw output does not contain checkpoints, so it cannot be replayed.");
-            records.sort((a, b) => recordTime(a) - recordTime(b));
-            checkpoints.sort((a, b) => a.t - b.t);
-            return {
-                metadata: loadedMetadata,
-                records,
-                checkpoints,
-                durationSeconds: loadedMetadata.config.simulation.durationSeconds,
-            };
+    function isCellReservationPurpose(type) {
+        return (type === "ParkInbound" ||
+            type === "RelocateBlocker" ||
+            type === "IdleUnblock");
+    }
+    function recordTime(record) {
+        return record.kind === "second" ? record.record.time : record.t;
+    }
+    function stringDetail(detail, key) {
+        const value = detail[key];
+        return typeof value === "string" ? value : undefined;
+    }
+    function cloneValue(value) {
+        if (typeof globalThis.structuredClone === "function") {
+            return globalThis.structuredClone(value);
+        }
+        return JSON.parse(JSON.stringify(value));
+    }
+    function formatDuration(totalSeconds) {
+        const seconds = Math.max(0, Math.round(totalSeconds));
+        const days = Math.floor(seconds / 86400);
+        const hours = Math.floor((seconds % 86400) / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        const remaining = seconds % 60;
+        const clock = [hours, minutes, remaining].map((value) => String(value).padStart(2, "0")).join(":");
+        return days > 0 ? `day ${days + 1}, ${clock}` : clock;
+    }
+    function clamp(value, min, max) {
+        return Math.min(max, Math.max(min, value));
+    }
+    function escapeHtml(value) {
+        return value
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+});
+define("browser/visualizer/computational-renderer", ["require", "exports", "browser/visualizer/operations"], function (require, exports, operations_js_1) {
+    "use strict";
+    Object.defineProperty(exports, "__esModule", { value: true });
+    exports.HtmlComputationalStateRenderer = void 0;
+    class HtmlComputationalStateRenderer {
+        render(container, frame, config) {
+            const snapshot = frame.snapshot;
+            const active = snapshot.activeOperations;
+            container.innerHTML = `
+      <section class="state-panel">
+        <h2>Simulation State</h2>
+        <dl class="state-list">
+          <div><dt>Scenario</dt><dd>${(0, operations_js_1.escapeHtml)(config.simulation.sessionName)}</dd></div>
+          <div><dt>Time</dt><dd>${(0, operations_js_1.formatDuration)(frame.time)}</dd></div>
+          <div><dt>Occupancy</dt><dd>${snapshot.occupancy.occupiedCount} / ${snapshot.occupancy.totalParkingCells}</dd></div>
+          <div><dt>Reserved Cells</dt><dd>${snapshot.occupancy.reservedCount ?? 0}</dd></div>
+          <div><dt>Effective Occupancy</dt><dd>${snapshot.occupancy.effectiveOccupiedCount ?? snapshot.occupancy.occupiedCount} / ${snapshot.occupancy.totalParkingCells}</dd></div>
+          <div><dt>Inbound Queue</dt><dd>${snapshot.queues.inboundLength}</dd></div>
+          <div><dt>Outbound Queue</dt><dd>${snapshot.queues.outboundLength}</dd></div>
+          <div><dt>Elevator</dt><dd>floor ${snapshot.elevator.currentFloor}, ${(0, operations_js_1.escapeHtml)(snapshot.elevator.direction ?? "stopped")}</dd></div>
+          <div><dt>Elevator Destination</dt><dd>${frame.elevatorDestination === undefined ? "none" : `floor ${frame.elevatorDestination}`}</dd></div>
+        </dl>
+      </section>
+      <section class="state-panel">
+        <h2>Outbound Queue</h2>
+        <div class="compact-queue">${snapshot.queues.outbound.length === 0 ? "<span class=\"muted-text\">Empty</span>" : snapshot.queues.outbound.map((item) => `<span>V ${(0, operations_js_1.escapeHtml)(item.vehicleId)} <small>@ ${(0, operations_js_1.formatDuration)(item.queuedAt)}</small></span>`).join("")}</div>
+      </section>
+      <section class="state-panel">
+        <h2>Active Operations</h2>
+        ${active.length === 0 ? "<p class=\"muted-text\">No active operations.</p>" : `<div class="operation-list">${frame.interpolatedOperations.map((item) => this.renderOperation(item)).join("")}</div>`}
+      </section>
+      <section class="state-panel">
+        <h2>Trip And Counters</h2>
+        <dl class="state-list">
+          <div><dt>Trip Phase</dt><dd>${(0, operations_js_1.escapeHtml)(snapshot.elevator.activeTrip?.phase ?? "none")}</dd></div>
+          <div><dt>Trip Route</dt><dd>${snapshot.elevator.activeTrip?.route.join(" -> ") ?? "none"}</dd></div>
+          <div><dt>Inbound Completed</dt><dd>${snapshot.counters.inboundCompleted}</dd></div>
+          <div><dt>Outbound Completed</dt><dd>${snapshot.counters.outboundCompleted}</dd></div>
+          <div><dt>VMR Distance</dt><dd>${Math.round(snapshot.counters.vmrDistanceMeters)} m</dd></div>
+        </dl>
+      </section>
+    `;
+        }
+        renderOperation(item) {
+            const operation = item.operation;
+            return `
+      <div class="operation-item">
+        <strong>${(0, operations_js_1.escapeHtml)(operation.type)}${operation.vehicleId ? `, V ${(0, operations_js_1.escapeHtml)(operation.vehicleId)}` : ""}</strong>
+        <span>${(0, operations_js_1.escapeHtml)(operation.from ?? "unknown")} -> ${(0, operations_js_1.escapeHtml)(operation.to ?? "unknown")}</span>
+        <progress max="1" value="${item.progress.toFixed(3)}"></progress>
+        <small>${Math.round(item.progress * 100)}%${item.currentLocation ? `, now ${(0, operations_js_1.escapeHtml)(item.currentLocation)}` : ""}</small>
+      </div>
+    `;
         }
     }
-    class CheckpointReplayEngine {
-        constructor(dataSet) {
-            this.dataSet = dataSet;
-            this.cache = new Map();
+    exports.HtmlComputationalStateRenderer = HtmlComputationalStateRenderer;
+});
+define("browser/visualizer/canvas-drawing", ["require", "exports"], function (require, exports) {
+    "use strict";
+    Object.defineProperty(exports, "__esModule", { value: true });
+    exports.fillRoundedRect = fillRoundedRect;
+    exports.drawArrowHead = drawArrowHead;
+    exports.drawStackedText = drawStackedText;
+    function fillRoundedRect(context, x, y, width, height, radius) {
+        const r = Math.min(radius, width / 2, height / 2);
+        context.beginPath();
+        context.moveTo(x + r, y);
+        context.lineTo(x + width - r, y);
+        context.quadraticCurveTo(x + width, y, x + width, y + r);
+        context.lineTo(x + width, y + height - r);
+        context.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+        context.lineTo(x + r, y + height);
+        context.quadraticCurveTo(x, y + height, x, y + height - r);
+        context.lineTo(x, y + r);
+        context.quadraticCurveTo(x, y, x + r, y);
+        context.closePath();
+        context.fill();
+    }
+    function drawArrowHead(context, from, to, color) {
+        if (!from || !to)
+            return;
+        const angle = Math.atan2(to.y - from.y, to.x - from.x);
+        const size = 9;
+        context.fillStyle = color;
+        context.beginPath();
+        context.moveTo(to.x, to.y);
+        context.lineTo(to.x - size * Math.cos(angle - Math.PI / 6), to.y - size * Math.sin(angle - Math.PI / 6));
+        context.lineTo(to.x - size * Math.cos(angle + Math.PI / 6), to.y - size * Math.sin(angle + Math.PI / 6));
+        context.closePath();
+        context.fill();
+    }
+    function drawStackedText(context, text, x, y, lineHeight) {
+        [...text].forEach((char, index) => {
+            context.fillText(char, x, y + index * lineHeight);
+        });
+    }
+});
+define("browser/visualizer/geometry", ["require", "exports", "browser/visualizer/operations"], function (require, exports, operations_js_2) {
+    "use strict";
+    Object.defineProperty(exports, "__esModule", { value: true });
+    exports.samplePolyline = samplePolyline;
+    exports.distance = distance;
+    exports.rectCenter = rectCenter;
+    exports.rectFromCenter = rectFromCenter;
+    exports.insetRectByPixels = insetRectByPixels;
+    exports.unionRects = unionRects;
+    exports.leftHalf = leftHalf;
+    exports.rightHalf = rightHalf;
+    function samplePolyline(points, progress) {
+        if (points.length === 0) {
+            const origin = { x: 0, y: 0 };
+            return { point: origin, previous: origin, next: origin };
         }
-        getFrameAt(time) {
-            const key = Math.round(clamp(time, 0, this.dataSet.durationSeconds));
-            const cached = this.cache.get(key);
-            if (cached) {
-                this.cache.delete(key);
-                this.cache.set(key, cached);
-                return cached;
-            }
-            const checkpoint = this.closestCheckpointAtOrBefore(key);
-            const cachedBase = this.closestCachedFrameAtOrBefore(key, checkpoint.t);
-            const baseTime = cachedBase ? cachedBase.time : checkpoint.t;
-            const snapshot = cachedBase
-                ? cloneValue(cachedBase.snapshot)
-                : cloneValue(checkpoint.snapshot);
-            for (const record of this.dataSet.records) {
-                const t = recordTime(record);
-                if (t <= baseTime)
-                    continue;
-                if (t > key)
-                    break;
-                this.applyRecord(snapshot, record);
-            }
-            snapshot.time = key;
-            this.cleanupActiveOperations(snapshot, key);
-            this.recalculateDerivedState(snapshot);
-            const elevatorDestination = this.currentElevatorDestination(snapshot.activeOperations);
-            const frame = {
-                time: key,
-                snapshot,
-                interpolatedOperations: snapshot.activeOperations.map((operation) => interpolateOperation(operation, key)),
-                ...(elevatorDestination !== undefined ? { elevatorDestination } : {}),
-            };
-            this.rememberFrame(key, frame);
-            return frame;
+        if (points.length === 1) {
+            const only = points[0] ?? { x: 0, y: 0 };
+            return { point: only, previous: only, next: only };
         }
-        closestCheckpointAtOrBefore(time) {
-            let low = 0;
-            let high = this.dataSet.checkpoints.length - 1;
-            let result = this.dataSet.checkpoints[0];
-            if (!result)
-                throw new Error("No checkpoints are available.");
-            while (low <= high) {
-                const mid = Math.floor((low + high) / 2);
-                const candidate = this.dataSet.checkpoints[mid];
-                if (!candidate)
-                    break;
-                if (candidate.t <= time) {
-                    result = candidate;
-                    low = mid + 1;
-                }
-                else {
-                    high = mid - 1;
-                }
-            }
-            return result;
+        const segmentLengths = [];
+        let totalLength = 0;
+        for (let index = 0; index < points.length - 1; index += 1) {
+            const from = points[index];
+            const to = points[index + 1];
+            if (!from || !to)
+                continue;
+            const length = distance(from, to);
+            segmentLengths.push(length);
+            totalLength += length;
         }
-        closestCachedFrameAtOrBefore(time, checkpointTime) {
-            let result = null;
-            for (const [cachedTime, frame] of this.cache) {
-                if (cachedTime <= checkpointTime || cachedTime >= time)
-                    continue;
-                if (!result || cachedTime > result.time)
-                    result = frame;
-            }
-            if (result) {
-                this.cache.delete(result.time);
-                this.cache.set(result.time, result);
-            }
-            return result;
+        if (totalLength === 0) {
+            const first = points[0] ?? { x: 0, y: 0 };
+            return { point: first, previous: first, next: first };
         }
-        applyRecord(snapshot, record) {
-            switch (record.kind) {
-                case "events":
-                    this.applyEvents(snapshot, record);
-                    break;
-                case "operations":
-                    this.applyOperations(snapshot, record);
-                    break;
-                case "state":
-                    this.applyState(snapshot, record);
-                    break;
-                case "checkpoint":
-                case "second":
-                    break;
-            }
-        }
-        applyEvents(snapshot, record) {
-            for (const result of record.intake) {
-                if (!result.accepted)
-                    continue;
-                const event = record.generated.find((candidate) => candidate.id === result.eventId);
-                const queued = {
-                    vehicleId: result.vehicleId,
-                    queuedAt: event?.time ?? record.t,
+        let remaining = (0, operations_js_2.clamp)(progress, 0, 1) * totalLength;
+        for (let index = 0; index < segmentLengths.length; index += 1) {
+            const length = segmentLengths[index] ?? 0;
+            const from = points[index];
+            const to = points[index + 1];
+            if (!from || !to)
+                continue;
+            if (remaining <= length || index === segmentLengths.length - 1) {
+                const localProgress = length === 0 ? 0 : remaining / length;
+                return {
+                    point: {
+                        x: from.x + (to.x - from.x) * localProgress,
+                        y: from.y + (to.y - from.y) * localProgress,
+                    },
+                    previous: from,
+                    next: to,
                 };
-                if (result.outcome === "QueuedInbound") {
-                    if (!snapshot.queues.inbound.some((item) => item.vehicleId === result.vehicleId)) {
-                        snapshot.queues.inbound.push(queued);
-                    }
-                }
-                if (result.outcome === "QueuedOutbound") {
-                    if (!snapshot.queues.outbound.some((item) => item.vehicleId === result.vehicleId)) {
-                        snapshot.queues.outbound.push(queued);
-                    }
-                }
             }
+            remaining -= length;
         }
-        applyOperations(snapshot, record) {
-            for (const operation of record.started ?? []) {
-                if (!snapshot.activeOperations.some((active) => active.id === operation.id)) {
-                    snapshot.activeOperations.push(cloneValue(operation));
-                }
-                this.applyOperationStart(snapshot, operation);
-            }
-            for (const operation of record.completed ?? []) {
-                this.applyOperationComplete(snapshot, operation, record.t);
-            }
-        }
-        applyState(snapshot, record) {
-            snapshot.counters = cloneValue(record.counters);
-            snapshot.occupancy.reservedCount =
-                record.occupancy.reservedCount ?? snapshot.occupancy.reservedCount ?? 0;
-            snapshot.occupancy.effectiveOccupiedCount =
-                record.occupancy.effectiveOccupiedCount ??
-                    snapshot.occupancy.effectiveOccupiedCount ??
-                    snapshot.occupancy.occupiedCount;
-            snapshot.occupancy.effectiveOccupancyPercent =
-                record.occupancy.effectiveOccupancyPercent ??
-                    snapshot.occupancy.effectiveOccupancyPercent ??
-                    snapshot.occupancy.occupancyPercent;
-        }
-        applyOperationStart(snapshot, operation) {
-            if (operation.type === "MoveElevator") {
-                const destination = elevatorPosition(operation.to);
-                snapshot.elevator.status = "Busy";
-                if (destination !== null) {
-                    snapshot.elevator.direction =
-                        destination > snapshot.elevator.currentFloor
-                            ? "up"
-                            : destination < snapshot.elevator.currentFloor
-                                ? "down"
-                                : "stopped";
-                }
-                return;
-            }
-            reserveDestinationForOperation(snapshot, operation);
-            const deckIndex = operationDeckIndex(operation);
-            if (deckIndex === null)
-                return;
-            const vmr = snapshot.vmrs[deckIndex];
-            if (!vmr)
-                return;
-            vmr.status = "Busy";
-            vmr.currentTask = {
-                type: operation.type,
-                startedAt: operation.startedAt,
-                completesAt: operation.completesAt,
-                ...(operation.from ? { from: operation.from } : {}),
-                ...(operation.to ? { to: operation.to } : {}),
-                ...(operation.vehicleId ? { vehicleId: operation.vehicleId } : {}),
-                ...(operation.path ? { path: operation.path } : {}),
-            };
-        }
-        applyOperationComplete(snapshot, operation, time) {
-            snapshot.activeOperations = snapshot.activeOperations.filter((active) => {
-                if (active.completesAt > time)
-                    return true;
-                if (active.type !== operation.type)
-                    return true;
-                if (operation.vehicleId && active.vehicleId !== operation.vehicleId)
-                    return true;
-                return false;
-            });
-            switch (operation.type) {
-                case "EnterInboundPreparationPosition":
-                    this.enterInboundPreparationPosition(snapshot, operation, time);
-                    break;
-                case "LoadInbound":
-                    this.loadDeckFromPreparationPosition(snapshot, operation, "inbound");
-                    break;
-                case "ParkInbound":
-                    this.parkFromDeck(snapshot, operation, time);
-                    break;
-                case "MoveBlocker":
-                case "LoadOutbound":
-                    this.loadDeckFromCell(snapshot, operation, operation.type === "LoadOutbound" ? "outbound" : "blocker");
-                    break;
-                case "RelocateBlocker":
-                case "IdleUnblock":
-                    this.parkFromDeck(snapshot, operation, time);
-                    break;
-                case "RetrieveOutbound":
-                    this.retrieveOutbound(snapshot, operation, time);
-                    break;
-                case "MoveElevator":
-                    this.moveElevator(snapshot, operation);
-                    break;
-                case "RotateDeck":
-                    this.rotateDeck(snapshot, operation);
-                    break;
-                case "OperateDoor":
-                    this.operateDoor(snapshot, operation, time);
-                    break;
-                case "UnloadOutbound":
-                    break;
-            }
-            this.finishVmrForOperation(snapshot, operation);
-            releaseReservationForCompletedOperation(snapshot, operation);
-        }
-        enterInboundPreparationPosition(snapshot, operation, time) {
-            if (!operation.vehicleId)
-                return;
-            const positionId = stringDetail(operation.detail, "preparationPositionId");
-            const position = positionId
-                ? snapshot.preparationPositions.find((candidate) => candidate.id === positionId)
-                : undefined;
-            if (position) {
-                position.occupiedBy = operation.vehicleId;
-                position.readyAt = time;
-                position.doorState = "open";
-            }
-            snapshot.queues.inbound = snapshot.queues.inbound.filter((item) => item.vehicleId !== operation.vehicleId);
-        }
-        loadDeckFromPreparationPosition(snapshot, operation, role) {
-            if (!operation.vehicleId)
-                return;
-            const from = stringDetail(operation.detail, "from");
-            const to = stringDetail(operation.detail, "to");
-            const positionId = stringDetail(operation.detail, "preparationPositionId") ?? from;
-            const position = positionId
-                ? snapshot.preparationPositions.find((candidate) => candidate.id === positionId)
-                : undefined;
-            if (position) {
-                delete position.occupiedBy;
-                delete position.readyAt;
-            }
-            const deck = deckByLocation(snapshot.elevator.decks ?? [], to);
-            if (deck) {
-                deck.vehicleId = operation.vehicleId;
-                deck.vehicleRole = role;
-            }
-        }
-        loadDeckFromCell(snapshot, operation, role) {
-            if (!operation.vehicleId)
-                return;
-            const to = stringDetail(operation.detail, "to");
-            removeOccupiedVehicle(snapshot, operation.vehicleId);
-            const deck = deckByLocation(snapshot.elevator.decks ?? [], to);
-            if (deck) {
-                deck.vehicleId = operation.vehicleId;
-                deck.vehicleRole = role;
-            }
-        }
-        parkFromDeck(snapshot, operation, time) {
-            if (!operation.vehicleId)
-                return;
-            const to = stringDetail(operation.detail, "to");
-            const from = stringDetail(operation.detail, "from");
-            if (to?.startsWith("f")) {
-                upsertOccupied(snapshot, {
-                    cellId: to,
-                    vehicleId: operation.vehicleId,
-                    parkedAt: time,
-                });
-            }
-            const deck = deckByLocation(snapshot.elevator.decks ?? [], from);
-            if (deck)
-                clearDeck(deck);
-        }
-        retrieveOutbound(snapshot, operation, time) {
-            if (!operation.vehicleId)
-                return;
-            const from = stringDetail(operation.detail, "from");
-            const to = stringDetail(operation.detail, "to");
-            const position = to
-                ? snapshot.preparationPositions.find((candidate) => candidate.id === to)
-                : undefined;
-            if (position) {
-                position.occupiedBy = operation.vehicleId;
-                position.readyAt = time;
-                position.doorState = "closed";
-            }
-            const deck = deckByLocation(snapshot.elevator.decks ?? [], from);
-            if (deck)
-                clearDeck(deck);
-            snapshot.queues.outbound = snapshot.queues.outbound.filter((item) => item.vehicleId !== operation.vehicleId);
-        }
-        moveElevator(snapshot, operation) {
-            const to = elevatorPosition(stringDetail(operation.detail, "to"));
-            if (to === null)
-                return;
-            snapshot.elevator.currentFloor = to;
-            snapshot.elevator.status = "Busy";
-            snapshot.elevator.direction = "stopped";
-            for (const deck of snapshot.elevator.decks ?? []) {
-                deck.alignedFloor = to - deck.index;
-            }
-        }
-        rotateDeck(snapshot, operation) {
-            const to = stringDetail(operation.detail, "to");
-            if (to !== "garage" && to !== "street")
-                return;
-            const group = stringDetail(operation.detail, "group");
-            const affectedDeck = inferDeckFromRotateGroup(snapshot.elevator.decks ?? [], group);
-            if (affectedDeck) {
-                affectedDeck.orientation = to;
-                return;
-            }
-            for (const deck of snapshot.elevator.decks ?? []) {
-                deck.orientation = to;
-            }
-        }
-        operateDoor(snapshot, operation, time) {
-            const to = stringDetail(operation.detail, "to");
-            if (to !== "open" && to !== "closed")
-                return;
-            const group = stringDetail(operation.detail, "group") ?? "";
-            const direction = group.includes("outbound") ? "outbound" : group.includes("inbound") ? "inbound" : null;
-            for (const position of snapshot.preparationPositions) {
-                if (direction && position.direction !== direction)
-                    continue;
-                position.doorState = to;
-                delete position.doorTransitionCompleteAt;
-                if (to === "open" && position.direction === "outbound" && position.occupiedBy) {
-                    position.readyAt = time;
-                }
-            }
-        }
-        finishVmrForOperation(snapshot, operation) {
-            const from = stringDetail(operation.detail, "from");
-            const to = stringDetail(operation.detail, "to");
-            const index = parseDeckIndex(from) ?? parseDeckIndex(to);
-            if (index === null)
-                return;
-            const vmr = snapshot.vmrs[index];
-            if (!vmr)
-                return;
-            vmr.status = "Idle";
-            delete vmr.currentTask;
-        }
-        cleanupActiveOperations(snapshot, time) {
-            snapshot.activeOperations = snapshot.activeOperations.filter((operation) => operation.completesAt > time);
-            const busyDeckIndexes = new Set();
-            for (const operation of snapshot.activeOperations) {
-                const deckIndex = operationDeckIndex(operation);
-                if (deckIndex !== null && operation.type !== "RotateDeck") {
-                    busyDeckIndexes.add(deckIndex);
-                }
-            }
-            snapshot.vmrs = snapshot.vmrs.map((vmr, index) => {
-                if (!busyDeckIndexes.has(index)) {
-                    const idle = { ...vmr, status: "Idle" };
-                    delete idle.currentTask;
-                    return idle;
-                }
-                return vmr;
-            });
-            snapshot.elevator.status = snapshot.activeOperations.length > 0 ? "Busy" : "IdleAtHome";
-        }
-        recalculateDerivedState(snapshot) {
-            snapshot.queues.inboundLength = snapshot.queues.inbound.length;
-            snapshot.queues.outboundLength = snapshot.queues.outbound.length;
-            snapshot.occupancy.occupied.sort((a, b) => a.cellId.localeCompare(b.cellId));
-            snapshot.occupancy.occupiedCount = snapshot.occupancy.occupied.length;
-            const occupiedCellIds = new Set(snapshot.occupancy.occupied.map((cell) => cell.cellId));
-            const reservedCount = (snapshot.occupancy.reservations ?? []).filter((reservation) => !occupiedCellIds.has(reservation.cellId)).length;
-            snapshot.occupancy.reservedCount = reservedCount;
-            snapshot.occupancy.effectiveOccupiedCount =
-                snapshot.occupancy.occupiedCount + reservedCount;
-            snapshot.occupancy.occupancyPercent =
-                snapshot.occupancy.totalParkingCells === 0
-                    ? 0
-                    : snapshot.occupancy.occupiedCount / snapshot.occupancy.totalParkingCells;
-            snapshot.occupancy.effectiveOccupancyPercent =
-                snapshot.occupancy.totalParkingCells === 0
-                    ? 0
-                    : snapshot.occupancy.effectiveOccupiedCount / snapshot.occupancy.totalParkingCells;
-        }
-        currentElevatorDestination(operations) {
-            const move = operations.find((operation) => operation.type === "MoveElevator");
-            const destination = move ? elevatorPosition(move.to) : null;
-            return destination ?? undefined;
-        }
-        rememberFrame(time, frame) {
-            this.cache.set(time, frame);
-            while (this.cache.size > frameCacheMaxEntries) {
-                const firstKey = this.cache.keys().next().value;
-                if (firstKey === undefined)
-                    return;
-                this.cache.delete(firstKey);
-            }
-        }
+        const last = points[points.length - 1] ?? { x: 0, y: 0 };
+        const previous = points[points.length - 2] ?? last;
+        return { point: last, previous, next: last };
     }
+    function distance(from, to) {
+        return Math.hypot(to.x - from.x, to.y - from.y);
+    }
+    function rectCenter(rect) {
+        return {
+            x: rect.x + rect.width / 2,
+            y: rect.y + rect.height / 2,
+        };
+    }
+    function rectFromCenter(center, width, height) {
+        return {
+            x: center.x - width / 2,
+            y: center.y - height / 2,
+            width,
+            height,
+        };
+    }
+    function insetRectByPixels(rect, xInset, yInset) {
+        return {
+            x: rect.x + xInset,
+            y: rect.y + yInset,
+            width: Math.max(8, rect.width - xInset * 2),
+            height: Math.max(8, rect.height - yInset * 2),
+        };
+    }
+    function unionRects(a, b) {
+        if (!a || !b)
+            return null;
+        const x = Math.min(a.x, b.x);
+        const y = Math.min(a.y, b.y);
+        const right = Math.max(a.x + a.width, b.x + b.width);
+        const bottom = Math.max(a.y + a.height, b.y + b.height);
+        return {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        };
+    }
+    function leftHalf(rect) {
+        return {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width / 2,
+            height: rect.height,
+        };
+    }
+    function rightHalf(rect) {
+        return {
+            x: rect.x + rect.width / 2,
+            y: rect.y,
+            width: rect.width / 2,
+            height: rect.height,
+        };
+    }
+});
+define("browser/visualizer/physical-renderer", ["require", "exports", "browser/visualizer/canvas-drawing", "browser/visualizer/geometry", "browser/visualizer/operations", "browser/visualizer/types"], function (require, exports, canvas_drawing_js_1, geometry_js_1, operations_js_3, types_js_1) {
+    "use strict";
+    Object.defineProperty(exports, "__esModule", { value: true });
+    exports.CanvasPhysicalStateRenderer = void 0;
     class CanvasPhysicalStateRenderer {
         constructor() {
             this.canvas = null;
@@ -3776,23 +3638,23 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
             const labelHeight = 28;
             const floorGap = 34;
             const streetGap = 14;
-            const cellWidthMeters = layout.streetFacing === "longSide" ? parkingCellLengthMeters : parkingCellWidthMeters;
-            const cellHeightMeters = layout.streetFacing === "longSide" ? parkingCellWidthMeters : parkingCellLengthMeters;
+            const cellWidthMeters = layout.streetFacing === "longSide" ? types_js_1.parkingCellLengthMeters : types_js_1.parkingCellWidthMeters;
+            const cellHeightMeters = layout.streetFacing === "longSide" ? types_js_1.parkingCellWidthMeters : types_js_1.parkingCellLengthMeters;
             const floorWidthMeters = layout.columns * cellWidthMeters;
             const floorHeightMeters = layout.rows * cellHeightMeters;
             const scale = Math.max(12, Math.min(34, (availableWidth - margin * 2) / floorWidthMeters));
             const longAxisHorizontal = layout.streetFacing === "longSide";
             const vehicleSize = {
-                width: (longAxisHorizontal ? vehicleLengthMeters : vehicleWidthMeters) * scale,
-                height: (longAxisHorizontal ? vehicleWidthMeters : vehicleLengthMeters) * scale,
+                width: (longAxisHorizontal ? types_js_1.vehicleLengthMeters : types_js_1.vehicleWidthMeters) * scale,
+                height: (longAxisHorizontal ? types_js_1.vehicleWidthMeters : types_js_1.vehicleLengthMeters) * scale,
             };
             const perpendicularVehicleSize = {
-                width: (longAxisHorizontal ? vehicleWidthMeters : vehicleLengthMeters) * scale,
-                height: (longAxisHorizontal ? vehicleLengthMeters : vehicleWidthMeters) * scale,
+                width: (longAxisHorizontal ? types_js_1.vehicleWidthMeters : types_js_1.vehicleLengthMeters) * scale,
+                height: (longAxisHorizontal ? types_js_1.vehicleLengthMeters : types_js_1.vehicleWidthMeters) * scale,
             };
             const vmrSize = {
-                width: (longAxisHorizontal ? vmrLengthMeters : vmrWidthMeters) * scale,
-                height: (longAxisHorizontal ? vmrWidthMeters : vmrLengthMeters) * scale,
+                width: (longAxisHorizontal ? types_js_1.vmrLengthMeters : types_js_1.vmrWidthMeters) * scale,
+                height: (longAxisHorizontal ? types_js_1.vmrWidthMeters : types_js_1.vmrLengthMeters) * scale,
             };
             const streetHeight = Math.max(126, vehicleSize.height * 3 + 78);
             const floorWidth = floorWidthMeters * scale;
@@ -3895,16 +3757,16 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
             if (layout.streetFacing !== "longSide" || layout.rows < 3 || layout.columns < 3) {
                 return [];
             }
-            const left = unionRects(cellsById.get("f1c4"), cellsById.get("f1c7"));
-            const right = unionRects(cellsById.get("f1c6"), cellsById.get("f1c9"));
+            const left = (0, geometry_js_1.unionRects)(cellsById.get("f1c4"), cellsById.get("f1c7"));
+            const right = (0, geometry_js_1.unionRects)(cellsById.get("f1c6"), cellsById.get("f1c9"));
             if (!left || !right)
                 return [];
-            return [leftHalf(left), rightHalf(left), leftHalf(right), rightHalf(right)];
+            return [(0, geometry_js_1.leftHalf)(left), (0, geometry_js_1.rightHalf)(left), (0, geometry_js_1.leftHalf)(right), (0, geometry_js_1.rightHalf)(right)];
         }
         drawBackground(context, geometry) {
             context.clearRect(0, 0, geometry.width, geometry.height);
             context.fillStyle = "#ffffff";
-            this.fillRoundedRect(context, 0, 0, geometry.width, geometry.height, 8);
+            (0, canvas_drawing_js_1.fillRoundedRect)(context, 0, 0, geometry.width, geometry.height, 8);
         }
         drawFloors(context, geometry, layout) {
             const unavailable = new Set([layout.elevatorCell, ...layout.unavailableCells]);
@@ -3914,7 +3776,7 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
                 context.fillText(`Floor ${floor}`, floorRect.x, floorRect.y - 9);
                 context.fillStyle = "#627178";
                 context.font = "12px Arial, Helvetica, sans-serif";
-                context.fillText(`${formatMeters(geometry.floorWidth / geometry.scale)}m x ${formatMeters(geometry.floorHeight / geometry.scale)}m`, floorRect.x + 78, floorRect.y - 9);
+                context.fillText(`${(0, operations_js_3.formatMeters)(geometry.floorWidth / geometry.scale)}m x ${(0, operations_js_3.formatMeters)(geometry.floorHeight / geometry.scale)}m`, floorRect.x + 78, floorRect.y - 9);
                 context.strokeStyle = "#ccd7d4";
                 context.lineWidth = 1;
                 context.strokeRect(floorRect.x, floorRect.y, floorRect.width, floorRect.height);
@@ -3941,7 +3803,7 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
         }
         drawStreet(context, geometry, snapshot) {
             context.fillStyle = "#f6f8f7";
-            this.fillRoundedRect(context, geometry.street.x, geometry.street.y, geometry.street.width, geometry.street.height, 8);
+            (0, canvas_drawing_js_1.fillRoundedRect)(context, geometry.street.x, geometry.street.y, geometry.street.width, geometry.street.height, 8);
             context.strokeStyle = "#d7dfdc";
             context.strokeRect(geometry.street.x, geometry.street.y, geometry.street.width, geometry.street.height);
             context.fillStyle = "#1f2a2e";
@@ -3976,7 +3838,7 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
                 context.strokeRect(rect.x, rect.y, rect.width, rect.height);
                 context.fillStyle = "#1f2a2e";
                 context.font = "700 11px Arial, Helvetica, sans-serif";
-                this.drawStackedText(context, physicalPreparationPositionLabel(position), rect.x + 9, rect.y + 20, 15);
+                (0, canvas_drawing_js_1.drawStackedText)(context, (0, operations_js_3.physicalPreparationPositionLabel)(position), rect.x + 9, rect.y + 20, 15);
                 context.font = "10px Arial, Helvetica, sans-serif";
                 context.fillText(position.doorState ?? "unknown", rect.x + 6, rect.y + rect.height - 6);
             }
@@ -3988,7 +3850,7 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
                 const rect = geometry.preparationPositions.get(position.id);
                 if (!rect)
                     continue;
-                this.drawVehicle(context, this.vehicleRectAt(rectCenter(rect), geometry, "perpendicular"), position.occupiedBy, "#14343d");
+                this.drawVehicle(context, this.vehicleRectAt((0, geometry_js_1.rectCenter)(rect), geometry, "perpendicular"), position.occupiedBy, "#14343d");
             }
         }
         drawPlannedPaths(context, geometry, frame) {
@@ -4008,11 +3870,11 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
                     context.lineTo(point.x, point.y);
                 context.stroke();
                 context.setLineDash([]);
-                this.drawArrowHead(context, points[points.length - 2], points[points.length - 1], color);
+                (0, canvas_drawing_js_1.drawArrowHead)(context, points[points.length - 2], points[points.length - 1], color);
                 const last = points[points.length - 1];
                 if (last) {
                     context.font = "700 11px Arial, Helvetica, sans-serif";
-                    context.fillText(`${deckLabel(item.operation)} dest`, last.x + 6, last.y - 6);
+                    context.fillText(`${(0, operations_js_3.deckLabel)(item.operation)} dest`, last.x + 6, last.y - 6);
                 }
                 context.restore();
             });
@@ -4025,7 +3887,7 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
                 const rect = geometry.cellsById.get(occupancy.cellId);
                 if (!rect)
                     continue;
-                this.drawVehicle(context, this.vehicleRectAt(rectCenter(rect), geometry), occupancy.vehicleId, "#14343d");
+                this.drawVehicle(context, this.vehicleRectAt((0, geometry_js_1.rectCenter)(rect), geometry), occupancy.vehicleId, "#14343d");
             }
         }
         drawReservedDestinations(context, geometry, frame) {
@@ -4036,7 +3898,7 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
                 const rect = geometry.cellsById.get(reservation.cellId);
                 if (!rect)
                     continue;
-                const vehicleRect = this.vehicleRectAt(rectCenter(rect), geometry);
+                const vehicleRect = this.vehicleRectAt((0, geometry_js_1.rectCenter)(rect), geometry);
                 context.save();
                 context.strokeStyle = "#a13a31";
                 context.lineWidth = 2;
@@ -4045,22 +3907,22 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
                 context.setLineDash([]);
                 context.fillStyle = "#a13a31";
                 context.font = "700 10px Arial, Helvetica, sans-serif";
-                context.fillText(`R ${shortId(reservation.vehicleId)}`, vehicleRect.x + 5, vehicleRect.y + 14);
+                context.fillText(`R ${(0, operations_js_3.shortId)(reservation.vehicleId)}`, vehicleRect.x + 5, vehicleRect.y + 14);
                 context.restore();
             }
         }
         drawElevatorDecks(context, geometry, frame) {
             const movingVehicles = this.movingVehicleIds(frame);
             const activeVmrDeckIndexes = this.activeVmrDeckIndexes(frame);
-            const decksByFloor = groupDecksByFloor(frame.snapshot.elevator.decks ?? []);
+            const decksByFloor = (0, operations_js_3.groupDecksByFloor)(frame.snapshot.elevator.decks ?? []);
             for (const [floor, decks] of decksByFloor) {
                 const shaft = geometry.elevatorByFloor.get(floor);
                 if (!shaft)
                     continue;
                 decks.forEach((deck, index) => {
-                    const deckRect = insetRectByPixels(shaft, 5 + index * 2, 18 + index * 2);
+                    const deckRect = (0, geometry_js_1.insetRectByPixels)(shaft, 5 + index * 2, 18 + index * 2);
                     context.fillStyle = "rgba(255, 255, 255, 0.68)";
-                    this.fillRoundedRect(context, deckRect.x, deckRect.y, deckRect.width, deckRect.height, 5);
+                    (0, canvas_drawing_js_1.fillRoundedRect)(context, deckRect.x, deckRect.y, deckRect.width, deckRect.height, 5);
                     context.strokeStyle = "#7d8f99";
                     context.strokeRect(deckRect.x, deckRect.y, deckRect.width, deckRect.height);
                     context.fillStyle = "#1f2a2e";
@@ -4070,10 +3932,10 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
                     context.font = "10px Arial, Helvetica, sans-serif";
                     context.fillText(deck.vmrId, deckRect.x + 5, deckRect.y + deckRect.height - 6);
                     if (!activeVmrDeckIndexes.has(deck.index)) {
-                        this.drawVmr(context, this.vmrRectAt(rectCenter(shaft), geometry), deck.vmrId);
+                        this.drawVmr(context, this.vmrRectAt((0, geometry_js_1.rectCenter)(shaft), geometry), deck.vmrId);
                     }
                     if (deck.vehicleId && !movingVehicles.has(deck.vehicleId)) {
-                        this.drawVehicle(context, this.vehicleRectAt(rectCenter(shaft), geometry), deck.vehicleId, deck.vehicleRole === "outbound" ? "#87352f" : "#14343d");
+                        this.drawVehicle(context, this.vehicleRectAt((0, geometry_js_1.rectCenter)(shaft), geometry), deck.vehicleId, deck.vehicleRole === "outbound" ? "#87352f" : "#14343d");
                     }
                 });
             }
@@ -4083,8 +3945,8 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
                 const points = this.polylineForOperation(geometry, item.operation);
                 if (points.length < 2)
                     continue;
-                const sample = samplePolyline(points, item.progress);
-                const deck = deckLabel(item.operation);
+                const sample = (0, geometry_js_1.samplePolyline)(points, item.progress);
+                const deck = (0, operations_js_3.deckLabel)(item.operation);
                 this.drawVmr(context, this.vmrRectAt(sample.point, geometry), deck);
                 context.fillStyle = "#1f2a2e";
                 context.font = "700 11px Arial, Helvetica, sans-serif";
@@ -4096,8 +3958,8 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
                 const points = this.polylineForOperation(geometry, item.operation);
                 if (points.length < 2)
                     continue;
-                const sample = samplePolyline(points, item.progress);
-                if (item.operation.vehicleId && carriesVehicle(item.operation.type)) {
+                const sample = (0, geometry_js_1.samplePolyline)(points, item.progress);
+                if (item.operation.vehicleId && (0, operations_js_3.carriesVehicle)(item.operation.type)) {
                     this.drawVehicle(context, this.vehicleRectAt({
                         x: sample.point.x,
                         y: sample.point.y - geometry.vmrSize.height * 0.18,
@@ -4124,18 +3986,18 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
         pointForLocation(geometry, location) {
             const cell = geometry.cellsById.get(location);
             if (cell)
-                return rectCenter(cell);
+                return (0, geometry_js_1.rectCenter)(cell);
             const elevatorMatch = location.match(/^f(\d+):elevator$/);
             if (elevatorMatch?.[1]) {
                 const elevator = geometry.elevatorByFloor.get(Number(elevatorMatch[1]));
-                return elevator ? rectCenter(elevator) : null;
+                return elevator ? (0, geometry_js_1.rectCenter)(elevator) : null;
             }
             return null;
         }
         movingVehicleIds(frame) {
             const result = new Set();
             for (const item of frame.interpolatedOperations) {
-                if (item.operation.vehicleId && item.operation.path && carriesVehicle(item.operation.type)) {
+                if (item.operation.vehicleId && item.operation.path && (0, operations_js_3.carriesVehicle)(item.operation.type)) {
                     result.add(item.operation.vehicleId);
                 }
             }
@@ -4144,7 +4006,7 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
         activeVmrDeckIndexes(frame) {
             const result = new Set();
             for (const item of frame.interpolatedOperations) {
-                const deckIndex = operationDeckIndex(item.operation);
+                const deckIndex = (0, operations_js_3.operationDeckIndex)(item.operation);
                 if (deckIndex !== null && item.operation.path && item.operation.type !== "RotateDeck") {
                     result.add(deckIndex);
                 }
@@ -4153,7 +4015,7 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
         }
         drawLabeledBox(context, rect, label, fill) {
             context.fillStyle = fill;
-            this.fillRoundedRect(context, rect.x, rect.y, rect.width, rect.height, 6);
+            (0, canvas_drawing_js_1.fillRoundedRect)(context, rect.x, rect.y, rect.width, rect.height, 6);
             context.strokeStyle = "#d7dfdc";
             context.strokeRect(rect.x, rect.y, rect.width, rect.height);
             context.fillStyle = "#1f2a2e";
@@ -4162,14 +4024,14 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
         }
         drawVehicle(context, rect, vehicleId, color) {
             context.fillStyle = color;
-            this.fillRoundedRect(context, rect.x, rect.y, rect.width, rect.height, 5);
+            (0, canvas_drawing_js_1.fillRoundedRect)(context, rect.x, rect.y, rect.width, rect.height, 5);
             context.fillStyle = "#ffffff";
             context.font = "700 10px Arial, Helvetica, sans-serif";
-            context.fillText(`V ${shortId(vehicleId)}`, rect.x + 5, rect.y + Math.min(rect.height - 5, 14));
+            context.fillText(`V ${(0, operations_js_3.shortId)(vehicleId)}`, rect.x + 5, rect.y + Math.min(rect.height - 5, 14));
         }
         drawVmr(context, rect, label) {
             context.fillStyle = "#0f7a6c";
-            this.fillRoundedRect(context, rect.x, rect.y, rect.width, rect.height, 5);
+            (0, canvas_drawing_js_1.fillRoundedRect)(context, rect.x, rect.y, rect.width, rect.height, 5);
             context.strokeStyle = "#ffffff";
             context.lineWidth = 2;
             context.strokeRect(rect.x, rect.y, rect.width, rect.height);
@@ -4181,341 +4043,466 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
             const size = orientation === "perpendicular"
                 ? geometry.perpendicularVehicleSize
                 : geometry.vehicleSize;
-            return rectFromCenter(center, size.width, size.height);
+            return (0, geometry_js_1.rectFromCenter)(center, size.width, size.height);
         }
         vmrRectAt(center, geometry) {
-            return rectFromCenter(center, geometry.vmrSize.width, geometry.vmrSize.height);
-        }
-        drawArrowHead(context, from, to, color) {
-            if (!from || !to)
-                return;
-            const angle = Math.atan2(to.y - from.y, to.x - from.x);
-            const size = 9;
-            context.fillStyle = color;
-            context.beginPath();
-            context.moveTo(to.x, to.y);
-            context.lineTo(to.x - size * Math.cos(angle - Math.PI / 6), to.y - size * Math.sin(angle - Math.PI / 6));
-            context.lineTo(to.x - size * Math.cos(angle + Math.PI / 6), to.y - size * Math.sin(angle + Math.PI / 6));
-            context.closePath();
-            context.fill();
-        }
-        fillRoundedRect(context, x, y, width, height, radius) {
-            const r = Math.min(radius, width / 2, height / 2);
-            context.beginPath();
-            context.moveTo(x + r, y);
-            context.lineTo(x + width - r, y);
-            context.quadraticCurveTo(x + width, y, x + width, y + r);
-            context.lineTo(x + width, y + height - r);
-            context.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
-            context.lineTo(x + r, y + height);
-            context.quadraticCurveTo(x, y + height, x, y + height - r);
-            context.lineTo(x, y + r);
-            context.quadraticCurveTo(x, y, x + r, y);
-            context.closePath();
-            context.fill();
-        }
-        drawStackedText(context, text, x, y, lineHeight) {
-            [...text].forEach((char, index) => {
-                context.fillText(char, x, y + index * lineHeight);
-            });
+            return (0, geometry_js_1.rectFromCenter)(center, geometry.vmrSize.width, geometry.vmrSize.height);
         }
     }
-    class HtmlComputationalStateRenderer {
-        render(container, frame, config) {
-            const snapshot = frame.snapshot;
-            const active = snapshot.activeOperations;
-            container.innerHTML = `
-      <section class="state-panel">
-        <h2>Simulation State</h2>
-        <dl class="state-list">
-          <div><dt>Scenario</dt><dd>${escapeHtml(config.simulation.sessionName)}</dd></div>
-          <div><dt>Time</dt><dd>${formatDuration(frame.time)}</dd></div>
-          <div><dt>Occupancy</dt><dd>${snapshot.occupancy.occupiedCount} / ${snapshot.occupancy.totalParkingCells}</dd></div>
-          <div><dt>Reserved Cells</dt><dd>${snapshot.occupancy.reservedCount ?? 0}</dd></div>
-          <div><dt>Effective Occupancy</dt><dd>${snapshot.occupancy.effectiveOccupiedCount ?? snapshot.occupancy.occupiedCount} / ${snapshot.occupancy.totalParkingCells}</dd></div>
-          <div><dt>Inbound Queue</dt><dd>${snapshot.queues.inboundLength}</dd></div>
-          <div><dt>Outbound Queue</dt><dd>${snapshot.queues.outboundLength}</dd></div>
-          <div><dt>Elevator</dt><dd>floor ${snapshot.elevator.currentFloor}, ${escapeHtml(snapshot.elevator.direction ?? "stopped")}</dd></div>
-          <div><dt>Elevator Destination</dt><dd>${frame.elevatorDestination === undefined ? "none" : `floor ${frame.elevatorDestination}`}</dd></div>
-        </dl>
-      </section>
-      <section class="state-panel">
-        <h2>Outbound Queue</h2>
-        <div class="compact-queue">${snapshot.queues.outbound.length === 0 ? "<span class=\"muted-text\">Empty</span>" : snapshot.queues.outbound.map((item) => `<span>V ${escapeHtml(item.vehicleId)} <small>@ ${formatDuration(item.queuedAt)}</small></span>`).join("")}</div>
-      </section>
-      <section class="state-panel">
-        <h2>Active Operations</h2>
-        ${active.length === 0 ? "<p class=\"muted-text\">No active operations.</p>" : `<div class="operation-list">${frame.interpolatedOperations.map((item) => this.renderOperation(item)).join("")}</div>`}
-      </section>
-      <section class="state-panel">
-        <h2>Trip And Counters</h2>
-        <dl class="state-list">
-          <div><dt>Trip Phase</dt><dd>${escapeHtml(snapshot.elevator.activeTrip?.phase ?? "none")}</dd></div>
-          <div><dt>Trip Route</dt><dd>${snapshot.elevator.activeTrip?.route.join(" -> ") ?? "none"}</dd></div>
-          <div><dt>Inbound Completed</dt><dd>${snapshot.counters.inboundCompleted}</dd></div>
-          <div><dt>Outbound Completed</dt><dd>${snapshot.counters.outboundCompleted}</dd></div>
-          <div><dt>VMR Distance</dt><dd>${Math.round(snapshot.counters.vmrDistanceMeters)} m</dd></div>
-        </dl>
-      </section>
-    `;
-        }
-        renderOperation(item) {
-            const operation = item.operation;
-            return `
-      <div class="operation-item">
-        <strong>${escapeHtml(operation.type)}${operation.vehicleId ? `, V ${escapeHtml(operation.vehicleId)}` : ""}</strong>
-        <span>${escapeHtml(operation.from ?? "unknown")} -> ${escapeHtml(operation.to ?? "unknown")}</span>
-        <progress max="1" value="${item.progress.toFixed(3)}"></progress>
-        <small>${Math.round(item.progress * 100)}%${item.currentLocation ? `, now ${escapeHtml(item.currentLocation)}` : ""}</small>
-      </div>
-    `;
-        }
-    }
-    function buildActivePathIndex(operations) {
-        const result = new Map();
-        for (const item of operations) {
-            const path = item.operation.path;
-            if (!path)
-                continue;
-            const label = `${deckLabel(item.operation)}${item.operation.vehicleId ? ` V${item.operation.vehicleId}` : ""}`;
-            for (const cell of path.cells) {
-                const entry = ensurePathEntry(result, cell);
-                entry.path.push(label);
+    exports.CanvasPhysicalStateRenderer = CanvasPhysicalStateRenderer;
+});
+define("browser/visualizer/raw-output-loader", ["require", "exports", "browser/visualizer/operations"], function (require, exports, operations_js_4) {
+    "use strict";
+    Object.defineProperty(exports, "__esModule", { value: true });
+    exports.JsonlVisualizerRawOutputLoader = void 0;
+    class JsonlVisualizerRawOutputLoader {
+        async load(file) {
+            const text = await file.text();
+            const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+            if (lines.length === 0)
+                throw new Error("The selected file is empty.");
+            let metadata = null;
+            const records = [];
+            const checkpoints = [];
+            for (let index = 0; index < lines.length; index += 1) {
+                const line = lines[index];
+                if (!line)
+                    continue;
+                let parsed;
+                try {
+                    parsed = JSON.parse(line);
+                }
+                catch (error) {
+                    throw new Error(`Line ${index + 1} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+                }
+                if (parsed.kind === "metadata") {
+                    metadata = parsed;
+                    continue;
+                }
+                records.push(parsed);
+                if (parsed.kind === "checkpoint")
+                    checkpoints.push(parsed);
             }
-            if (item.currentLocation?.startsWith("f")) {
-                ensurePathEntry(result, item.currentLocation).current.push(label);
+            if (!metadata)
+                throw new Error("The raw output does not contain a metadata record.");
+            const loadedMetadata = metadata;
+            if (checkpoints.length === 0)
+                throw new Error("The raw output does not contain checkpoints, so it cannot be replayed.");
+            records.sort((a, b) => (0, operations_js_4.recordTime)(a) - (0, operations_js_4.recordTime)(b));
+            checkpoints.sort((a, b) => a.t - b.t);
+            return {
+                metadata: loadedMetadata,
+                records,
+                checkpoints,
+                durationSeconds: loadedMetadata.config.simulation.durationSeconds,
+            };
+        }
+    }
+    exports.JsonlVisualizerRawOutputLoader = JsonlVisualizerRawOutputLoader;
+});
+define("browser/visualizer/replay-engine", ["require", "exports", "browser/visualizer/operations", "browser/visualizer/types"], function (require, exports, operations_js_5, types_js_2) {
+    "use strict";
+    Object.defineProperty(exports, "__esModule", { value: true });
+    exports.CheckpointReplayEngine = void 0;
+    class CheckpointReplayEngine {
+        constructor(dataSet) {
+            this.dataSet = dataSet;
+            this.cache = new Map();
+        }
+        getFrameAt(time) {
+            const key = Math.round((0, operations_js_5.clamp)(time, 0, this.dataSet.durationSeconds));
+            const cached = this.cache.get(key);
+            if (cached) {
+                this.cache.delete(key);
+                this.cache.set(key, cached);
+                return cached;
             }
-            if (item.destination?.startsWith("f")) {
-                ensurePathEntry(result, item.destination).destination.push(`to ${label}`);
+            const checkpoint = this.closestCheckpointAtOrBefore(key);
+            const cachedBase = this.closestCachedFrameAtOrBefore(key, checkpoint.t);
+            const baseTime = cachedBase ? cachedBase.time : checkpoint.t;
+            const snapshot = cachedBase
+                ? (0, operations_js_5.cloneValue)(cachedBase.snapshot)
+                : (0, operations_js_5.cloneValue)(checkpoint.snapshot);
+            for (const record of this.dataSet.records) {
+                const t = (0, operations_js_5.recordTime)(record);
+                if (t <= baseTime)
+                    continue;
+                if (t > key)
+                    break;
+                this.applyRecord(snapshot, record);
+            }
+            snapshot.time = key;
+            this.cleanupActiveOperations(snapshot, key);
+            this.recalculateDerivedState(snapshot);
+            const elevatorDestination = this.currentElevatorDestination(snapshot.activeOperations);
+            const frame = {
+                time: key,
+                snapshot,
+                interpolatedOperations: snapshot.activeOperations.map((operation) => (0, operations_js_5.interpolateOperation)(operation, key)),
+                ...(elevatorDestination !== undefined ? { elevatorDestination } : {}),
+            };
+            this.rememberFrame(key, frame);
+            return frame;
+        }
+        closestCheckpointAtOrBefore(time) {
+            let low = 0;
+            let high = this.dataSet.checkpoints.length - 1;
+            let result = this.dataSet.checkpoints[0];
+            if (!result)
+                throw new Error("No checkpoints are available.");
+            while (low <= high) {
+                const mid = Math.floor((low + high) / 2);
+                const candidate = this.dataSet.checkpoints[mid];
+                if (!candidate)
+                    break;
+                if (candidate.t <= time) {
+                    result = candidate;
+                    low = mid + 1;
+                }
+                else {
+                    high = mid - 1;
+                }
+            }
+            return result;
+        }
+        closestCachedFrameAtOrBefore(time, checkpointTime) {
+            let result = null;
+            for (const [cachedTime, frame] of this.cache) {
+                if (cachedTime <= checkpointTime || cachedTime >= time)
+                    continue;
+                if (!result || cachedTime > result.time)
+                    result = frame;
+            }
+            if (result) {
+                this.cache.delete(result.time);
+                this.cache.set(result.time, result);
+            }
+            return result;
+        }
+        applyRecord(snapshot, record) {
+            switch (record.kind) {
+                case "events":
+                    this.applyEvents(snapshot, record);
+                    break;
+                case "operations":
+                    this.applyOperations(snapshot, record);
+                    break;
+                case "state":
+                    this.applyState(snapshot, record);
+                    break;
+                case "checkpoint":
+                case "second":
+                    break;
             }
         }
-        return result;
-    }
-    function groupDecksByFloor(decks) {
-        const result = new Map();
-        for (const deck of decks) {
-            const list = result.get(deck.alignedFloor) ?? [];
-            list.push(deck);
-            result.set(deck.alignedFloor, list);
-        }
-        return result;
-    }
-    function ensurePathEntry(map, cellId) {
-        const existing = map.get(cellId);
-        if (existing)
-            return existing;
-        const entry = { path: [], current: [], destination: [] };
-        map.set(cellId, entry);
-        return entry;
-    }
-    function interpolateOperation(operation, time) {
-        const duration = Math.max(1, operation.completesAt - operation.startedAt);
-        const progress = clamp((time - operation.startedAt) / duration, 0, 1);
-        const pathLocation = pathLocationAt(operation.path, progress);
-        return {
-            operation,
-            progress,
-            ...(pathLocation.current ? { currentLocation: pathLocation.current } : {}),
-            ...(pathLocation.destination ? { destination: pathLocation.destination } : {}),
-        };
-    }
-    function pathLocationAt(path, progress) {
-        if (!path || path.locations.length === 0)
-            return {};
-        const lastIndex = path.locations.length - 1;
-        const index = Math.min(lastIndex, Math.max(0, Math.floor(progress * lastIndex)));
-        return {
-            ...(path.locations[index] ? { current: path.locations[index] } : {}),
-            ...(path.locations[lastIndex] ? { destination: path.locations[lastIndex] } : {}),
-        };
-    }
-    function samplePolyline(points, progress) {
-        if (points.length === 0) {
-            const origin = { x: 0, y: 0 };
-            return { point: origin, previous: origin, next: origin };
-        }
-        if (points.length === 1) {
-            const only = points[0] ?? { x: 0, y: 0 };
-            return { point: only, previous: only, next: only };
-        }
-        const segmentLengths = [];
-        let totalLength = 0;
-        for (let index = 0; index < points.length - 1; index += 1) {
-            const from = points[index];
-            const to = points[index + 1];
-            if (!from || !to)
-                continue;
-            const length = distance(from, to);
-            segmentLengths.push(length);
-            totalLength += length;
-        }
-        if (totalLength === 0) {
-            const first = points[0] ?? { x: 0, y: 0 };
-            return { point: first, previous: first, next: first };
-        }
-        let remaining = clamp(progress, 0, 1) * totalLength;
-        for (let index = 0; index < segmentLengths.length; index += 1) {
-            const length = segmentLengths[index] ?? 0;
-            const from = points[index];
-            const to = points[index + 1];
-            if (!from || !to)
-                continue;
-            if (remaining <= length || index === segmentLengths.length - 1) {
-                const localProgress = length === 0 ? 0 : remaining / length;
-                return {
-                    point: {
-                        x: from.x + (to.x - from.x) * localProgress,
-                        y: from.y + (to.y - from.y) * localProgress,
-                    },
-                    previous: from,
-                    next: to,
+        applyEvents(snapshot, record) {
+            for (const result of record.intake) {
+                if (!result.accepted)
+                    continue;
+                const event = record.generated.find((candidate) => candidate.id === result.eventId);
+                const queued = {
+                    vehicleId: result.vehicleId,
+                    queuedAt: event?.time ?? record.t,
                 };
+                if (result.outcome === "QueuedInbound") {
+                    if (!snapshot.queues.inbound.some((item) => item.vehicleId === result.vehicleId)) {
+                        snapshot.queues.inbound.push(queued);
+                    }
+                }
+                if (result.outcome === "QueuedOutbound") {
+                    if (!snapshot.queues.outbound.some((item) => item.vehicleId === result.vehicleId)) {
+                        snapshot.queues.outbound.push(queued);
+                    }
+                }
             }
-            remaining -= length;
         }
-        const last = points[points.length - 1] ?? { x: 0, y: 0 };
-        const previous = points[points.length - 2] ?? last;
-        return { point: last, previous, next: last };
-    }
-    function distance(from, to) {
-        return Math.hypot(to.x - from.x, to.y - from.y);
-    }
-    function rectCenter(rect) {
-        return {
-            x: rect.x + rect.width / 2,
-            y: rect.y + rect.height / 2,
-        };
-    }
-    function rectFromCenter(center, width, height) {
-        return {
-            x: center.x - width / 2,
-            y: center.y - height / 2,
-            width,
-            height,
-        };
-    }
-    function insetRectByPixels(rect, xInset, yInset) {
-        return {
-            x: rect.x + xInset,
-            y: rect.y + yInset,
-            width: Math.max(8, rect.width - xInset * 2),
-            height: Math.max(8, rect.height - yInset * 2),
-        };
-    }
-    function unionRects(a, b) {
-        if (!a || !b)
-            return null;
-        const x = Math.min(a.x, b.x);
-        const y = Math.min(a.y, b.y);
-        const right = Math.max(a.x + a.width, b.x + b.width);
-        const bottom = Math.max(a.y + a.height, b.y + b.height);
-        return {
-            x,
-            y,
-            width: right - x,
-            height: bottom - y,
-        };
-    }
-    function leftHalf(rect) {
-        return {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width / 2,
-            height: rect.height,
-        };
-    }
-    function rightHalf(rect) {
-        return {
-            x: rect.x + rect.width / 2,
-            y: rect.y,
-            width: rect.width / 2,
-            height: rect.height,
-        };
-    }
-    function physicalPreparationPositionLabel(position) {
-        const number = Number(/\d+$/.exec(position.id)?.[0] ?? 1);
-        if (position.id.startsWith("IPP"))
-            return `PP${5 - number}`;
-        if (position.id.startsWith("OPP"))
-            return `PP${3 - number}`;
-        return position.id.replace(/^P/, "PP");
-    }
-    function carriesVehicle(type) {
-        return (type === "ParkInbound" ||
-            type === "LoadOutbound" ||
-            type === "MoveBlocker" ||
-            type === "RelocateBlocker" ||
-            type === "IdleUnblock");
-    }
-    function shortId(id) {
-        return id.length <= 8 ? id : id.slice(-8);
-    }
-    function formatMeters(value) {
-        return Number.isInteger(value) ? String(value) : value.toFixed(1);
-    }
-    function operationDeckIndex(operation) {
-        return parseDeckIndex(operation.from) ?? parseDeckIndex(operation.to);
-    }
-    function deckByLocation(decks, location) {
-        const index = parseDeckIndex(location);
-        return index === null ? undefined : decks[index];
-    }
-    function parseDeckIndex(location) {
-        if (!location?.startsWith("D"))
-            return null;
-        const value = Number(location.slice(1));
-        return Number.isFinite(value) && value >= 1 ? value - 1 : null;
-    }
-    function deckLabel(operation) {
-        const index = operationDeckIndex(operation);
-        return index === null ? "VMR" : `D${index + 1}`;
-    }
-    function elevatorPosition(location) {
-        if (!location?.startsWith("elevator-position-"))
-            return null;
-        const value = Number(location.slice("elevator-position-".length));
-        return Number.isFinite(value) ? value : null;
-    }
-    function inferDeckFromRotateGroup(decks, group) {
-        if (!group)
-            return undefined;
-        const match = group.match(/D(\d+)/i);
-        if (!match?.[1])
-            return undefined;
-        const index = Number(match[1]) - 1;
-        return decks[index];
-    }
-    function reserveDestinationForOperation(snapshot, operation) {
-        if (!isCellReservationPurpose(operation.type) || !operation.vehicleId || !operation.to?.startsWith("f")) {
-            return;
+        applyOperations(snapshot, record) {
+            for (const operation of record.started ?? []) {
+                if (!snapshot.activeOperations.some((active) => active.id === operation.id)) {
+                    snapshot.activeOperations.push((0, operations_js_5.cloneValue)(operation));
+                }
+                this.applyOperationStart(snapshot, operation);
+            }
+            for (const operation of record.completed ?? []) {
+                this.applyOperationComplete(snapshot, operation, record.t);
+            }
         }
-        const reservation = {
-            cellId: operation.to,
-            vehicleId: operation.vehicleId,
-            operationId: operation.id,
-            reservedAt: operation.startedAt,
-            expectedOccupiedAt: operation.completesAt,
-            purpose: operation.type,
-        };
-        const existing = snapshot.occupancy.reservations ?? [];
-        snapshot.occupancy.reservations = [
-            ...existing.filter((candidate) => candidate.cellId !== reservation.cellId &&
-                candidate.operationId !== reservation.operationId),
-            reservation,
-        ];
+        applyState(snapshot, record) {
+            snapshot.counters = (0, operations_js_5.cloneValue)(record.counters);
+            snapshot.occupancy.reservedCount =
+                record.occupancy.reservedCount ?? snapshot.occupancy.reservedCount ?? 0;
+            snapshot.occupancy.effectiveOccupiedCount =
+                record.occupancy.effectiveOccupiedCount ??
+                    snapshot.occupancy.effectiveOccupiedCount ??
+                    snapshot.occupancy.occupiedCount;
+            snapshot.occupancy.effectiveOccupancyPercent =
+                record.occupancy.effectiveOccupancyPercent ??
+                    snapshot.occupancy.effectiveOccupancyPercent ??
+                    snapshot.occupancy.occupancyPercent;
+        }
+        applyOperationStart(snapshot, operation) {
+            if (operation.type === "MoveElevator") {
+                const destination = (0, operations_js_5.elevatorPosition)(operation.to);
+                snapshot.elevator.status = "Busy";
+                if (destination !== null) {
+                    snapshot.elevator.direction =
+                        destination > snapshot.elevator.currentFloor
+                            ? "up"
+                            : destination < snapshot.elevator.currentFloor
+                                ? "down"
+                                : "stopped";
+                }
+                return;
+            }
+            (0, operations_js_5.reserveDestinationForOperation)(snapshot, operation);
+            const deckIndex = (0, operations_js_5.operationDeckIndex)(operation);
+            if (deckIndex === null)
+                return;
+            const vmr = snapshot.vmrs[deckIndex];
+            if (!vmr)
+                return;
+            vmr.status = "Busy";
+            vmr.currentTask = {
+                type: operation.type,
+                startedAt: operation.startedAt,
+                completesAt: operation.completesAt,
+                ...(operation.from ? { from: operation.from } : {}),
+                ...(operation.to ? { to: operation.to } : {}),
+                ...(operation.vehicleId ? { vehicleId: operation.vehicleId } : {}),
+                ...(operation.path ? { path: operation.path } : {}),
+            };
+        }
+        applyOperationComplete(snapshot, operation, time) {
+            snapshot.activeOperations = snapshot.activeOperations.filter((active) => {
+                if (active.completesAt > time)
+                    return true;
+                if (active.type !== operation.type)
+                    return true;
+                if (operation.vehicleId && active.vehicleId !== operation.vehicleId)
+                    return true;
+                return false;
+            });
+            switch (operation.type) {
+                case "EnterInboundPreparationPosition":
+                    this.enterInboundPreparationPosition(snapshot, operation, time);
+                    break;
+                case "LoadInbound":
+                    this.loadDeckFromPreparationPosition(snapshot, operation, "inbound");
+                    break;
+                case "ParkInbound":
+                    this.parkFromDeck(snapshot, operation, time);
+                    break;
+                case "MoveBlocker":
+                case "LoadOutbound":
+                    this.loadDeckFromCell(snapshot, operation, operation.type === "LoadOutbound" ? "outbound" : "blocker");
+                    break;
+                case "RelocateBlocker":
+                case "IdleUnblock":
+                    this.parkFromDeck(snapshot, operation, time);
+                    break;
+                case "RetrieveOutbound":
+                    this.retrieveOutbound(snapshot, operation, time);
+                    break;
+                case "MoveElevator":
+                    this.moveElevator(snapshot, operation);
+                    break;
+                case "RotateDeck":
+                    this.rotateDeck(snapshot, operation);
+                    break;
+                case "OperateDoor":
+                    this.operateDoor(snapshot, operation, time);
+                    break;
+                case "UnloadOutbound":
+                    break;
+            }
+            this.finishVmrForOperation(snapshot, operation);
+            (0, operations_js_5.releaseReservationForCompletedOperation)(snapshot, operation);
+        }
+        enterInboundPreparationPosition(snapshot, operation, time) {
+            if (!operation.vehicleId)
+                return;
+            const positionId = (0, operations_js_5.stringDetail)(operation.detail, "preparationPositionId");
+            const position = positionId
+                ? snapshot.preparationPositions.find((candidate) => candidate.id === positionId)
+                : undefined;
+            if (position) {
+                position.occupiedBy = operation.vehicleId;
+                position.readyAt = time;
+                position.doorState = "open";
+            }
+            snapshot.queues.inbound = snapshot.queues.inbound.filter((item) => item.vehicleId !== operation.vehicleId);
+        }
+        loadDeckFromPreparationPosition(snapshot, operation, role) {
+            if (!operation.vehicleId)
+                return;
+            const from = (0, operations_js_5.stringDetail)(operation.detail, "from");
+            const to = (0, operations_js_5.stringDetail)(operation.detail, "to");
+            const positionId = (0, operations_js_5.stringDetail)(operation.detail, "preparationPositionId") ?? from;
+            const position = positionId
+                ? snapshot.preparationPositions.find((candidate) => candidate.id === positionId)
+                : undefined;
+            if (position) {
+                delete position.occupiedBy;
+                delete position.readyAt;
+            }
+            const deck = (0, operations_js_5.deckByLocation)(snapshot.elevator.decks ?? [], to);
+            if (deck) {
+                deck.vehicleId = operation.vehicleId;
+                deck.vehicleRole = role;
+            }
+        }
+        loadDeckFromCell(snapshot, operation, role) {
+            if (!operation.vehicleId)
+                return;
+            const to = (0, operations_js_5.stringDetail)(operation.detail, "to");
+            removeOccupiedVehicle(snapshot, operation.vehicleId);
+            const deck = (0, operations_js_5.deckByLocation)(snapshot.elevator.decks ?? [], to);
+            if (deck) {
+                deck.vehicleId = operation.vehicleId;
+                deck.vehicleRole = role;
+            }
+        }
+        parkFromDeck(snapshot, operation, time) {
+            if (!operation.vehicleId)
+                return;
+            const to = (0, operations_js_5.stringDetail)(operation.detail, "to");
+            const from = (0, operations_js_5.stringDetail)(operation.detail, "from");
+            if (to?.startsWith("f")) {
+                upsertOccupied(snapshot, {
+                    cellId: to,
+                    vehicleId: operation.vehicleId,
+                    parkedAt: time,
+                });
+            }
+            const deck = (0, operations_js_5.deckByLocation)(snapshot.elevator.decks ?? [], from);
+            if (deck)
+                clearDeck(deck);
+        }
+        retrieveOutbound(snapshot, operation, time) {
+            if (!operation.vehicleId)
+                return;
+            const from = (0, operations_js_5.stringDetail)(operation.detail, "from");
+            const to = (0, operations_js_5.stringDetail)(operation.detail, "to");
+            const position = to
+                ? snapshot.preparationPositions.find((candidate) => candidate.id === to)
+                : undefined;
+            if (position) {
+                position.occupiedBy = operation.vehicleId;
+                position.readyAt = time;
+                position.doorState = "closed";
+            }
+            const deck = (0, operations_js_5.deckByLocation)(snapshot.elevator.decks ?? [], from);
+            if (deck)
+                clearDeck(deck);
+            snapshot.queues.outbound = snapshot.queues.outbound.filter((item) => item.vehicleId !== operation.vehicleId);
+        }
+        moveElevator(snapshot, operation) {
+            const to = (0, operations_js_5.elevatorPosition)((0, operations_js_5.stringDetail)(operation.detail, "to"));
+            if (to === null)
+                return;
+            snapshot.elevator.currentFloor = to;
+            snapshot.elevator.status = "Busy";
+            snapshot.elevator.direction = "stopped";
+            for (const deck of snapshot.elevator.decks ?? []) {
+                deck.alignedFloor = to - deck.index;
+            }
+        }
+        rotateDeck(snapshot, operation) {
+            const to = (0, operations_js_5.stringDetail)(operation.detail, "to");
+            if (to !== "garage" && to !== "street")
+                return;
+            const group = (0, operations_js_5.stringDetail)(operation.detail, "group");
+            const affectedDeck = (0, operations_js_5.inferDeckFromRotateGroup)(snapshot.elevator.decks ?? [], group);
+            if (affectedDeck) {
+                affectedDeck.orientation = to;
+                return;
+            }
+            for (const deck of snapshot.elevator.decks ?? []) {
+                deck.orientation = to;
+            }
+        }
+        operateDoor(snapshot, operation, time) {
+            const to = (0, operations_js_5.stringDetail)(operation.detail, "to");
+            if (to !== "open" && to !== "closed")
+                return;
+            const group = (0, operations_js_5.stringDetail)(operation.detail, "group") ?? "";
+            const direction = group.includes("outbound") ? "outbound" : group.includes("inbound") ? "inbound" : null;
+            for (const position of snapshot.preparationPositions) {
+                if (direction && position.direction !== direction)
+                    continue;
+                position.doorState = to;
+                delete position.doorTransitionCompleteAt;
+                if (to === "open" && position.direction === "outbound" && position.occupiedBy) {
+                    position.readyAt = time;
+                }
+            }
+        }
+        finishVmrForOperation(snapshot, operation) {
+            const from = (0, operations_js_5.stringDetail)(operation.detail, "from");
+            const to = (0, operations_js_5.stringDetail)(operation.detail, "to");
+            const index = (0, operations_js_5.parseDeckIndex)(from) ?? (0, operations_js_5.parseDeckIndex)(to);
+            if (index === null)
+                return;
+            const vmr = snapshot.vmrs[index];
+            if (!vmr)
+                return;
+            vmr.status = "Idle";
+            delete vmr.currentTask;
+        }
+        cleanupActiveOperations(snapshot, time) {
+            snapshot.activeOperations = snapshot.activeOperations.filter((operation) => operation.completesAt > time);
+            const busyDeckIndexes = new Set();
+            for (const operation of snapshot.activeOperations) {
+                const deckIndex = (0, operations_js_5.operationDeckIndex)(operation);
+                if (deckIndex !== null && operation.type !== "RotateDeck") {
+                    busyDeckIndexes.add(deckIndex);
+                }
+            }
+            snapshot.vmrs = snapshot.vmrs.map((vmr, index) => {
+                if (!busyDeckIndexes.has(index)) {
+                    const idle = { ...vmr, status: "Idle" };
+                    delete idle.currentTask;
+                    return idle;
+                }
+                return vmr;
+            });
+            snapshot.elevator.status = snapshot.activeOperations.length > 0 ? "Busy" : "IdleAtHome";
+        }
+        recalculateDerivedState(snapshot) {
+            snapshot.queues.inboundLength = snapshot.queues.inbound.length;
+            snapshot.queues.outboundLength = snapshot.queues.outbound.length;
+            snapshot.occupancy.occupied.sort((a, b) => a.cellId.localeCompare(b.cellId));
+            snapshot.occupancy.occupiedCount = snapshot.occupancy.occupied.length;
+            const occupiedCellIds = new Set(snapshot.occupancy.occupied.map((cell) => cell.cellId));
+            const reservedCount = (snapshot.occupancy.reservations ?? []).filter((reservation) => !occupiedCellIds.has(reservation.cellId)).length;
+            snapshot.occupancy.reservedCount = reservedCount;
+            snapshot.occupancy.effectiveOccupiedCount =
+                snapshot.occupancy.occupiedCount + reservedCount;
+            snapshot.occupancy.occupancyPercent =
+                snapshot.occupancy.totalParkingCells === 0
+                    ? 0
+                    : snapshot.occupancy.occupiedCount / snapshot.occupancy.totalParkingCells;
+            snapshot.occupancy.effectiveOccupancyPercent =
+                snapshot.occupancy.totalParkingCells === 0
+                    ? 0
+                    : snapshot.occupancy.effectiveOccupiedCount / snapshot.occupancy.totalParkingCells;
+        }
+        currentElevatorDestination(operations) {
+            const move = operations.find((operation) => operation.type === "MoveElevator");
+            const destination = move ? (0, operations_js_5.elevatorPosition)(move.to) : null;
+            return destination ?? undefined;
+        }
+        rememberFrame(time, frame) {
+            this.cache.set(time, frame);
+            while (this.cache.size > types_js_2.frameCacheMaxEntries) {
+                const firstKey = this.cache.keys().next().value;
+                if (firstKey === undefined)
+                    return;
+                this.cache.delete(firstKey);
+            }
+        }
     }
-    function releaseReservationForCompletedOperation(snapshot, operation) {
-        if (!isCellReservationPurpose(operation.type))
-            return;
-        const to = stringDetail(operation.detail, "to");
-        snapshot.occupancy.reservations = (snapshot.occupancy.reservations ?? []).filter((reservation) => reservation.cellId !== to &&
-            (!operation.vehicleId || reservation.vehicleId !== operation.vehicleId));
-    }
-    function isCellReservationPurpose(type) {
-        return (type === "ParkInbound" ||
-            type === "RelocateBlocker" ||
-            type === "IdleUnblock");
-    }
+    exports.CheckpointReplayEngine = CheckpointReplayEngine;
     function removeOccupiedVehicle(snapshot, vehicleId) {
         snapshot.occupancy.occupied = snapshot.occupancy.occupied.filter((cell) => cell.vehicleId !== vehicleId);
     }
@@ -4528,18 +4515,127 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
         delete deck.vehicleId;
         delete deck.vehicleRole;
     }
-    function recordTime(record) {
-        return record.kind === "second" ? record.record.time : record.t;
+});
+define("browser/visualizer", ["require", "exports", "browser/visualizer/computational-renderer", "browser/visualizer/operations", "browser/visualizer/physical-renderer", "browser/visualizer/raw-output-loader", "browser/visualizer/replay-engine", "browser/visualizer/types"], function (require, exports, computational_renderer_js_1, operations_js_6, physical_renderer_js_1, raw_output_loader_js_1, replay_engine_js_1, types_js_3) {
+    "use strict";
+    Object.defineProperty(exports, "__esModule", { value: true });
+    exports.startVisualizer = startVisualizer;
+    function startVisualizer() {
+        const root = document.querySelector("[data-visualizer-root]");
+        if (!root)
+            return;
+        new BrowserVisualizerApp(root).start();
     }
-    function stringDetail(detail, key) {
-        const value = detail[key];
-        return typeof value === "string" ? value : undefined;
-    }
-    function cloneValue(value) {
-        if (typeof globalThis.structuredClone === "function") {
-            return globalThis.structuredClone(value);
+    class BrowserVisualizerApp {
+        constructor(root) {
+            this.root = root;
+            this.dataSet = null;
+            this.replayEngine = null;
+            this.isPlaying = false;
+            this.lastAnimationTime = 0;
+            this.currentTime = 0;
+            this.animationHandle = 0;
+            this.loader = new raw_output_loader_js_1.JsonlVisualizerRawOutputLoader();
+            this.physicalRenderer = new physical_renderer_js_1.CanvasPhysicalStateRenderer();
+            this.computationalRenderer = new computational_renderer_js_1.HtmlComputationalStateRenderer();
+            this.fileInput = requiredElement(root, "#raw-output-input", HTMLInputElement);
+            this.status = requiredElement(root, "#visualizer-status", HTMLElement);
+            this.playButton = requiredElement(root, "#play-button", HTMLButtonElement);
+            this.pauseButton = requiredElement(root, "#pause-button", HTMLButtonElement);
+            this.slider = requiredElement(root, "#time-slider", HTMLInputElement);
+            this.timeReadout = requiredElement(root, "#time-readout", HTMLElement);
+            this.physicalView = requiredElement(root, "#physical-state-view", HTMLElement);
+            this.computationalView = requiredElement(root, "#computational-state-view", HTMLElement);
         }
-        return JSON.parse(JSON.stringify(value));
+        start() {
+            this.fileInput.addEventListener("change", () => void this.loadSelectedFile());
+            this.playButton.addEventListener("click", () => this.play());
+            this.pauseButton.addEventListener("click", () => this.pause());
+            this.slider.addEventListener("input", () => {
+                this.pause();
+                this.seek(Number(this.slider.value));
+            });
+            this.setControls(false);
+            this.setStatus("Select a raw JSONL output file to inspect.", "normal");
+        }
+        async loadSelectedFile() {
+            const file = this.fileInput.files?.[0];
+            if (!file)
+                return;
+            this.pause();
+            this.setStatus(`Loading ${file.name}...`, "normal");
+            try {
+                this.dataSet = await this.loader.load(file);
+                this.replayEngine = new replay_engine_js_1.CheckpointReplayEngine(this.dataSet);
+                this.currentTime = 0;
+                this.slider.min = "0";
+                this.slider.max = String(this.dataSet.durationSeconds);
+                this.slider.step = "1";
+                this.slider.value = "0";
+                this.setControls(true);
+                this.renderCurrentFrame();
+                this.setStatus(`Loaded ${file.name}. ${this.dataSet.records.length.toLocaleString()} records, ${this.dataSet.checkpoints.length.toLocaleString()} checkpoints.`, "normal");
+            }
+            catch (error) {
+                this.dataSet = null;
+                this.replayEngine = null;
+                this.setControls(false);
+                this.setStatus(error instanceof Error ? error.message : String(error), "error");
+            }
+        }
+        play() {
+            if (!this.replayEngine || this.isPlaying)
+                return;
+            this.isPlaying = true;
+            this.lastAnimationTime = performance.now();
+            this.animationHandle = requestAnimationFrame((timestamp) => this.advance(timestamp));
+            this.setControls(true);
+        }
+        pause() {
+            if (this.animationHandle) {
+                cancelAnimationFrame(this.animationHandle);
+                this.animationHandle = 0;
+            }
+            this.isPlaying = false;
+            this.setControls(Boolean(this.replayEngine));
+        }
+        advance(timestamp) {
+            if (!this.isPlaying || !this.dataSet)
+                return;
+            const elapsedSeconds = (timestamp - this.lastAnimationTime) / 1000;
+            this.lastAnimationTime = timestamp;
+            const nextTime = Math.min(this.dataSet.durationSeconds, this.currentTime + elapsedSeconds * types_js_3.playbackSecondsPerSecond);
+            this.seek(nextTime);
+            if (nextTime >= this.dataSet.durationSeconds) {
+                this.pause();
+                return;
+            }
+            this.animationHandle = requestAnimationFrame((nextTimestamp) => this.advance(nextTimestamp));
+        }
+        seek(time) {
+            if (!this.dataSet)
+                return;
+            this.currentTime = (0, operations_js_6.clamp)(time, 0, this.dataSet.durationSeconds);
+            this.slider.value = String(Math.round(this.currentTime));
+            this.renderCurrentFrame();
+        }
+        renderCurrentFrame() {
+            if (!this.replayEngine || !this.dataSet)
+                return;
+            const frame = this.replayEngine.getFrameAt(Math.round(this.currentTime));
+            this.timeReadout.textContent = (0, operations_js_6.formatDuration)(frame.time);
+            this.physicalRenderer.render(this.physicalView, frame, this.dataSet.metadata.config.garage);
+            this.computationalRenderer.render(this.computationalView, frame, this.dataSet.metadata.config);
+        }
+        setControls(enabled) {
+            this.playButton.disabled = !enabled || this.isPlaying;
+            this.pauseButton.disabled = !enabled || !this.isPlaying;
+            this.slider.disabled = !enabled;
+        }
+        setStatus(message, state) {
+            this.status.textContent = message;
+            this.status.dataset.state = state;
+        }
     }
     function requiredElement(root, selector, constructor) {
         const element = root.querySelector(selector);
@@ -4547,25 +4643,5 @@ define("browser/visualizer", ["require", "exports"], function (require, exports)
             throw new Error(`Missing required visualizer element: ${selector}`);
         }
         return element;
-    }
-    function formatDuration(totalSeconds) {
-        const seconds = Math.max(0, Math.round(totalSeconds));
-        const days = Math.floor(seconds / 86400);
-        const hours = Math.floor((seconds % 86400) / 3600);
-        const minutes = Math.floor((seconds % 3600) / 60);
-        const remaining = seconds % 60;
-        const clock = [hours, minutes, remaining].map((value) => String(value).padStart(2, "0")).join(":");
-        return days > 0 ? `day ${days + 1}, ${clock}` : clock;
-    }
-    function clamp(value, min, max) {
-        return Math.min(max, Math.max(min, value));
-    }
-    function escapeHtml(value) {
-        return value
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;")
-            .replace(/"/g, "&quot;")
-            .replace(/'/g, "&#039;");
     }
 });
