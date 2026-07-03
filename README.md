@@ -53,7 +53,7 @@ Build the static browser app:
 npm run build:browser
 ```
 
-Then open [public/index.html](public/index.html) in a browser.
+`public/simulator.bundle.js` is a generated artifact (git-ignored) and must be built before serving the `public/` directory locally. After running the command above, open [public/index.html](public/index.html) in a browser.
 The user-friendly configuration and report guide is available at [public/documentation.html](public/documentation.html).
 
 Run the example simulation:
@@ -156,7 +156,7 @@ The browser build emits:
 public/simulator.bundle.js
 ```
 
-That bundle is compiled from the same TypeScript core used by the Node CLI. The browser path uses an in-memory recorder instead of filesystem writes, then downloads raw output and report files through the browser.
+That bundle is a generated artifact (git-ignored) compiled from the same TypeScript core used by the Node CLI. You must run `npm run build:browser` before serving `public/` locally — without the build step, the static site is non-functional. The GitHub Pages deploy workflow runs this build automatically. The browser path uses an in-memory recorder instead of filesystem writes, then downloads raw output and report files through the browser.
 
 ## Configuration
 
