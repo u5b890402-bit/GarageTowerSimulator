@@ -40,6 +40,30 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+
+  verify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify deployed pages are accessible
+        env:
+          PAGE_URL: ${{ needs.deploy.outputs.page_url }}
+        run: |
+          base="${PAGE_URL%/}"
+          fail=0
+          for page in index.html documentation.html visualizer.html; do
+            url="$base/$page"
+            code=$(curl -sS -L --retry 5 --retry-delay 10 --retry-all-errors -o /dev/null -w '%{http_code}' "$url")
+            if [ "$code" = "200" ]; then
+              echo "OK   $url ($code)"
+            else
+              echo "FAIL $url ($code)"
+              fail=1
+            fi
+          done
+          exit $fail
